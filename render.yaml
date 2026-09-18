@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: tiktok-roblox-live-manager
+    runtime: python
+    plan: free
+    buildCommand: python -m pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: API_KEY
+        generateValue: true
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: MAX_SESSIONS
+        value: "5"
+      - key: MAX_EVENTS
+        value: "2500"
+      - key: MAX_PARTICIPANTS
+        value: "2000"
+      - key: OFFLINE_RETRY_SECONDS
+        value: "30"
+      - key: RECONNECT_BASE_SECONDS
+        value: "5"
+      - key: RECONNECT_MAX_SECONDS
+        value: "60"
+      - key: IGNORE_BROKEN_PAYLOAD
+        value: "true"
+      - key: STORE_RAW_DIAGNOSTICS
+        value: "true"
+      - key: AUTO_CONNECT_USERS
+        value: ""

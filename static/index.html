@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TikTok → Roblox Live Manager</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="login" class="login-wrap hidden">
+    <div class="login-card">
+      <div class="logo">LIVE MANAGER</div>
+      <h2>Entrar no painel</h2>
+      <p>Use a senha configurada em <code>DASHBOARD_PASSWORD</code>.</p>
+      <input id="loginPassword" type="password" placeholder="Senha">
+      <button class="primary" onclick="login()">Entrar</button>
+      <div id="loginError" class="error"></div>
+    </div>
+  </div>
+
+  <aside>
+    <div class="brand">LIVE<br><span>MANAGER</span></div>
+    <div class="brand-sub">TikTok → Roblox</div>
+    <nav>
+      <button data-tab="lives" onclick="tab('lives')">◉ <span>Lives</span></button>
+      <button data-tab="events" onclick="tab('events')">⚡ <span>Eventos</span></button>
+      <button data-tab="monitor" onclick="tab('monitor')">⚠ <span>Monitor</span></button>
+      <button data-tab="rules" onclick="tab('rules')">◇ <span>Regras</span></button>
+      <button data-tab="ranking" onclick="tab('ranking')">★ <span>Ranking</span></button>
+      <button data-tab="roblox" onclick="tab('roblox')">◆ <span>Roblox/Teste</span></button>
+    </nav>
+    <button class="logout" onclick="logout()">Sair</button>
+  </aside>
+
+  <main>
+    <header>
+      <div>
+        <h1 id="pageTitle">Lives</h1>
+        <p id="pageSubtitle">Conecte contas sem redeploy e acompanhe o estado de cada sessão.</p>
+      </div>
+      <div class="header-badges">
+        <span id="backendStatus" class="badge neutral">Backend...</span>
+        <span id="versionBadge" class="badge neutral">v?</span>
+      </div>
+    </header>
+
+    <section id="lives" class="page">
+      <div class="card connect-card">
+        <h3>Conectar LIVE</h3>
+        <div class="form-grid">
+          <div>
+            <label>Conta TikTok</label>
+            <input id="username" placeholder="@usuario">
+          </div>
+          <div>
+            <label>Perfil de gameplay</label>
+            <select id="connectProfile"></select>
+          </div>
+        </div>
+        <div class="row">
+          <button class="primary" onclick="connectLive()">Conectar</button>
+          <button onclick="saveFavorite()">Salvar conta no navegador</button>
+        </div>
+        <div id="favorites" class="favorites"></div>
+      </div>
+      <div id="sessions" class="grid"></div>
+    </section>
+
+    <section id="events" class="page hidden">
+      <div class="card">
+        <div class="toolbar">
+          <div>
+            <label>Sessão</label>
+            <select id="eventSession" onchange="loadEvents()"></select>
+          </div>
+          <div>
+            <label>Filtro</label>
+            <select id="eventFilter" onchange="renderCachedEvents()">
+              <option value="">Todos</option>
+              <option value="gift">Presentes</option>
+              <option value="comment">Comentários</option>
+              <option value="like">Likes</option>
+              <option value="follow">Follows</option>
+              <option value="share">Shares</option>
+              <option value="diagnostic">Diagnóstico</option>
+              <option value="simulation">Simulações</option>
+            </select>
+          </div>
+          <div class="toolbar-actions">
+            <button onclick="exportJson()">Exportar JSON</button>
+            <button onclick="exportCsv()">Exportar CSV</button>
+          </div>
+        </div>
+        <div id="eventList" class="feed"></div>
+      </div>
+    </section>
+
+    <section id="monitor" class="page hidden">
+      <div id="safetyBanner" class="safety-banner hidden"></div>
+      <div class="grid">
+        <div class="card">
+          <h3>Estado da sessão</h3>
+          <div id="monitorState"></div>
+          <button class="primary" onclick="resetSafety()">Liberar automações / resetar alerta</button>
+        </div>
+        <div class="card">
+          <h3>Eventos de diagnóstico</h3>
+          <p class="muted">Sinais servem para diagnóstico e pausa conservadora, não para contornar moderação.</p>
+          <div id="diagnostics" class="feed compact"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="rules" class="page hidden">
+      <div class="grid">
+        <div class="card">
+          <h3>Perfil</h3>
+          <label>Sessão</label>
+          <select id="rulesSession" onchange="loadRules()"></select>
+          <div id="profileButtons" class="profile-buttons"></div>
+          <hr>
+          <label><input id="cfgComment" type="checkbox"> Comentários ativos</label>
+          <label><input id="cfgLike" type="checkbox"> Likes ativos</label>
+          <label><input id="cfgFollow" type="checkbox"> Follows ativos</label>
+          <label><input id="cfgShare" type="checkbox"> Shares ativos</label>
+          <label><input id="cfgGift" type="checkbox"> Presentes ativos</label>
+          <label><input id="cfgSafety" type="checkbox"> Pausar automações em alerta de alta severidade</label>
+          <button class="primary" onclick="saveConfig()">Salvar configuração</button>
+        </div>
+        <div class="card">
+          <h3>Editor avançado de regras</h3>
+          <p class="muted">Cada regra transforma um evento em uma ou mais ações para o Roblox.</p>
+          <textarea id="rulesJson" spellcheck="false"></textarea>
+          <div class="row">
+            <button class="primary" onclick="saveRules()">Salvar regras</button>
+            <button onclick="formatRules()">Formatar JSON</button>
+          </div>
+          <div id="rulesError" class="error"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="ranking" class="page hidden">
+      <div class="card">
+        <div class="toolbar">
+          <div>
+            <label>Sessão</label>
+            <select id="rankSession" onchange="loadRanking()"></select>
+          </div>
+          <div>
+            <label>Ordenar por</label>
+            <select id="rankSort" onchange="loadRanking()">
+              <option value="coins">Moedas</option>
+              <option value="gifts">Presentes</option>
+              <option value="likes">Likes</option>
+              <option value="comments">Comentários</option>
+              <option value="shares">Shares</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>#</th><th>Usuário</th><th>Moedas</th><th>Gifts</th><th>Likes</th><th>Comentários</th><th>Shares</th></tr></thead>
+            <tbody id="rankingBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="roblox" class="page hidden">
+      <div class="grid">
+        <div class="card">
+          <h3>Simular evento</h3>
+          <label>Sessão</label>
+          <select id="simSession"></select>
+          <label>Tipo</label>
+          <select id="simType">
+            <option value="gift">Gift</option>
+            <option value="comment">Comment</option>
+            <option value="like">Like</option>
+            <option value="follow">Follow</option>
+            <option value="share">Share</option>
+          </select>
+          <label>Usuário</label><input id="simUser" value="JulioTeste">
+          <label>Presente</label><input id="simGift" value="Rose">
+          <label>Moedas por presente</label><input id="simCoins" type="number" value="1">
+          <label>Quantidade</label><input id="simCount" type="number" value="1">
+          <label>Comentário</label><input id="simComment" value="me coloca">
+          <button class="primary" onclick="simulate()">Enviar evento simulado</button>
+          <div id="simResult" class="muted"></div>
+        </div>
+        <div class="card">
+          <h3>Integração Roblox</h3>
+          <p>O script deve ficar em <code>ServerScriptService</code>. Nunca exponha a API key em LocalScript.</p>
+          <p>O bridge usa <strong>long polling</strong>, registra a sessão automaticamente e se recupera de restart do Render.</p>
+          <div class="codebox">POST /api/bridge/register<br>GET /api/bridge/&lt;session&gt;/poll?after=&lt;cursor&gt;&amp;wait=8</div>
+          <p class="muted">Ao iniciar o Roblox, o cursor começa no evento mais recente para evitar repetir presentes antigos.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
