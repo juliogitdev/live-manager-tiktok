@@ -1,4 +1,4 @@
-# TikTok → Roblox Live Manager v4
+# TikTok → Roblox Live Manager v4.1
 
 Backend pronto para Render com painel web, múltiplas contas TikTok, monitor de diagnóstico, simulador e bridge robusto para Roblox.
 
@@ -23,28 +23,46 @@ Backend pronto para Render com painel web, múltiplas contas TikTok, monitor de 
 
 ## Monitor de diagnóstico
 
-Sinais acompanhados quando disponíveis na versão instalada:
+A v4.1 não classifica mais um evento como perigoso somente pelo nome da classe. O monitor usa:
 
-### Alta severidade
-- `BottomEvent`
-- `PerceptionEvent`
-- `PartnershipPunishEvent`
-- `RoomVerifyEvent`
-- `GiftDynamicRestrictionEvent`
+- timestamp interno do TikTok;
+- momento em que o backend conectou;
+- conteúdo real do payload;
+- deduplicação por `msgId`;
+- supressão de banners vazios/repetitivos;
+- corroboração entre tipos diferentes de sinal.
 
-### Média
-- `AccessControlEvent`
-- `GiftPromptEvent`
+Níveis:
 
-### Informativos
-- `NoticeEvent`
-- `RoomNotifyEvent`
-- `SystemEvent`
-- `InRoomBannerEvent`
-- `ToastEvent`
-- `AccessRecallEvent`
+- `INFO`: informativo, não altera o monitor.
+- `HISTORICAL`: mensagem antiga/backlog recebida ao conectar; nunca pausa.
+- `OBSERVATION`: sinal atual mas fraco/vazio; nunca pausa.
+- `ALERT`: sinal atual com conteúdo relevante; requer revisão, mas não pausa sozinho.
+- `CRITICAL`: sinal forte atual e significativo, ou dois alertas diferentes corroborados; pode pausar automações.
 
-Esses sinais **não são tratados como "anti-ban"**. O objetivo é registrar, alertar e, opcionalmente, pausar ações automáticas para revisão.
+Por padrão, somente `CRITICAL` pausa ações automáticas. A conexão e o registro de eventos continuam ativos.
+
+Um `GiftDynamicRestrictionEvent` com `dynamicRestriction: {}` não é tratado como restrição confirmada. Se seu `createTime` for anterior à conexão, ele vira `HISTORICAL`; se for atual mas vazio, `OBSERVATION`.
+
+Banners informativos vazios como `InRoomBannerEvent` são suprimidos para não inflar o contador nem consumir o buffer.
+
+### Políticas por tipo
+
+**Strong:** `BottomEvent`, `PerceptionEvent`, `PartnershipPunishEvent`. Só viram `CRITICAL` diretamente quando atuais e com conteúdo.
+
+**Watch:** `GiftDynamicRestrictionEvent`, `RoomVerifyEvent`, `AccessControlEvent`, `GiftPromptEvent`. Um evento isolado não é crítico apenas pelo nome.
+
+**Info:** `NoticeEvent`, `RoomNotifyEvent`, `SystemEvent`, `InRoomBannerEvent`, `ToastEvent`, `AccessRecallEvent`.
+
+Parâmetros ajustáveis no Render:
+
+```env
+DIAGNOSTIC_HISTORICAL_GRACE_SECONDS=15
+DIAGNOSTIC_FRESH_MAX_SECONDS=120
+DIAGNOSTIC_STARTUP_QUARANTINE_SECONDS=20
+DIAGNOSTIC_CORROBORATION_SECONDS=20
+DIAGNOSTIC_REPEAT_SUPPRESS_SECONDS=30
+```
 
 ## Perfis incluídos
 

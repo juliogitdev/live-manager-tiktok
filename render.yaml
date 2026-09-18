@@ -31,5 +31,15 @@ services:
         value: "true"
       - key: STORE_RAW_DIAGNOSTICS
         value: "true"
+      - key: DIAGNOSTIC_HISTORICAL_GRACE_SECONDS
+        value: "15"
+      - key: DIAGNOSTIC_FRESH_MAX_SECONDS
+        value: "120"
+      - key: DIAGNOSTIC_STARTUP_QUARANTINE_SECONDS
+        value: "20"
+      - key: DIAGNOSTIC_CORROBORATION_SECONDS
+        value: "20"
+      - key: DIAGNOSTIC_REPEAT_SUPPRESS_SECONDS
+        value: "30"
       - key: AUTO_CONNECT_USERS
         value: ""
