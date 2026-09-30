@@ -10,7 +10,8 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
+from typing import Literal
 
 from .auth import (
     check_password, clear_login_cookie, require_api_key,
@@ -42,20 +43,20 @@ class LoginRequest(BaseModel):
 
 class ConnectRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
-    profile: str = "raw"
+    profile: Literal["raw", "dance", "kite"] = "raw"
 
 
 class SimulationRequest(BaseModel):
     type: str
-    username: str = "Teste"
-    gift_name: str = "Rose"
+    username: str = Field(default="Teste", max_length=64)
+    gift_name: str = Field(default="Rose", max_length=200)
     gift_coins: int = Field(default=1, ge=0, le=1000000)
     count: int = Field(default=1, ge=1, le=1000000)
-    comment: str = "teste"
+    comment: str = Field(default="teste", max_length=2000)
 
 
 class ConfigRequest(BaseModel):
-    config: dict[str, Any]
+    config: dict[str, StrictBool]
 
 
 class RulesRequest(BaseModel):
@@ -63,17 +64,19 @@ class RulesRequest(BaseModel):
 
 
 class ProfileRequest(BaseModel):
-    profile: str
+    profile: Literal["raw", "dance", "kite"]
 
 
 class BridgeRegisterRequest(BaseModel):
-    username: str
-    profile: str = "raw"
-    consumer_id: str = "roblox"
+    username: str = Field(min_length=1, max_length=64)
+    profile: Literal["raw", "dance", "kite"] = "raw"
+    consumer_id: str = Field(default="roblox", max_length=128)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from .auth import validate_secrets
+    validate_secrets()
     asyncio.create_task(manager.auto_connect())
     yield
     await manager.stop_all()
@@ -161,7 +164,7 @@ async def connect_live(body: ConnectRequest, request: Request, x_api_key: str | 
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return {"created": created, **session.snapshot()}
+    return {"created": created, "profile_conflict": body.profile != session.profile_name, **session.snapshot()}
 
 
 @app.post("/api/live/{sid}/disconnect")
@@ -208,12 +211,19 @@ async def update_config(
     s = get_session(sid)
     allowed = {
         "comment_enabled", "like_enabled", "follow_enabled",
-        "share_enabled", "gift_enabled", "safety_auto_pause_high",
+        "share_enabled", "gift_enabled", "safety_auto_pause_critical",
         "count_simulations_in_stats",
     }
-    for key, value in body.config.items():
-        if key in allowed:
-            s.config[key] = bool(value)
+    # v4.0 alias controls the v4.1 critical policy; it never restores type-only pauses.
+    config = dict(body.config)
+    if "safety_auto_pause_high" in config:
+        old = config.pop("safety_auto_pause_high")
+        if "safety_auto_pause_critical" in config and config["safety_auto_pause_critical"] != old:
+            raise HTTPException(status_code=400, detail="Conflicting safety settings")
+        config["safety_auto_pause_critical"] = old
+    if config.keys() - allowed:
+        raise HTTPException(status_code=400, detail="Unknown configuration field")
+    s.config.update(config)
     return s.config
 
 
@@ -252,7 +262,10 @@ async def reset_safety(sid: str, request: Request, x_api_key: str | None = Heade
     s = get_session(sid)
     s.state["safety_state"] = "NORMAL"
     s.state["last_safety_event"] = None
+    s.state["last_monitor_event"] = None
     s.state["automation_paused"] = False
+    s.recent_safety_signals.clear()
+    await s.push("safety_reset", {"automation_paused": False}, source="control")
     return {"ok": True}
 
 
@@ -350,7 +363,7 @@ async def export_csv(sid: str, request: Request, x_api_key: str | None = Header(
     )
 
 
-# Roblox-facing API: API key only, stateless and restart-safe.
+# Bridge API: API key only; in-memory history is lost on restart.
 @app.post("/api/bridge/register")
 async def bridge_register(body: BridgeRegisterRequest, x_api_key: str | None = Header(default=None)):
     require_api_key(x_api_key)
@@ -366,6 +379,11 @@ async def bridge_register(body: BridgeRegisterRequest, x_api_key: str | None = H
         "session_id": s.session_id,
         "username": s.username,
         "profile": s.profile_name,
+        "profile_conflict": body.profile != s.profile_name,
+        "requested_profile": body.profile,
+        "oldest_seq": s.events[0]["seq"] if s.events else s.seq,
+        "latest_seq": s.seq,
+        "gap_detected": False,
         # Start at current sequence to avoid replaying old gifts after Roblox restarts.
         "cursor": s.seq,
         "state": s.state["connection_state"],
@@ -378,24 +396,31 @@ async def bridge_poll(
     sid: str,
     after: int = Query(0, ge=0),
     wait: float = Query(8.0, ge=0, le=15),
+    recover: bool = Query(False),
     limit: int = Query(100, ge=1, le=250),
     x_api_key: str | None = Header(default=None),
 ):
     require_api_key(x_api_key)
     s = get_session(sid)
 
+    # Recheck retention after the wait: a burst can evict events before this task resumes.
+    rows = await s.wait_for_events(after, wait) if after <= s.seq else []
     oldest = s.events[0]["seq"] if s.events else s.seq
-    if s.events and after < oldest - 1:
+    gap = bool(s.events and after < oldest - 1) or after > s.seq
+    if gap and (not recover or after > s.seq):
         return {
             "ok": True,
             "cursor_expired": True,
+            "gap_detected": True,
+            "session_id": s.session_id,
+            "oldest_seq": oldest,
+            "connection_state": s.state["connection_state"],
             "events": [],
             "cursor": s.seq,
             "latest_seq": s.seq,
             "automation_paused": s.state["automation_paused"],
         }
 
-    rows = await s.wait_for_events(after, wait)
     rows = rows[:limit]
 
     # Roblox gets gameplay-sized payloads, not raw diagnostic payloads.
@@ -410,12 +435,17 @@ async def bridge_poll(
             "data": e["data"] if e["type"] in {"comment", "like", "follow", "share", "gift", "subscription"} else {},
             "actions": e.get("actions") or [],
             "safety": e.get("safety"),
+            "schema_version": e["schema_version"],
+            "automation_paused_at_ingest": e["automation_paused_at_ingest"],
         })
 
     cursor = rows[-1]["seq"] if rows else after
     return {
         "ok": True,
         "cursor_expired": False,
+        "gap_detected": gap,
+        "session_id": s.session_id,
+        "oldest_seq": s.events[0]["seq"] if s.events else s.seq,
         "events": bridge_rows,
         "cursor": cursor,
         "latest_seq": s.seq,

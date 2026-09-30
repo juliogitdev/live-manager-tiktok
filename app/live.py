@@ -12,6 +12,10 @@ from TikTokLive.client.errors import UserOfflineError
 
 from .config import settings
 from .rules import actions_for, get_profile, validate_rules
+from .diagnostics import (
+    DIAGNOSTIC_EVENTS, LEVEL_RANK, classify_diagnostic, content_fingerprint,
+    extract_event_time_ms, payload_has_meaningful_content, summarize_unknown_payload,
+)
 
 log = logging.getLogger("live-manager")
 
@@ -32,7 +36,7 @@ REDACT_PARTS = ("cookie", "token", "signature", "session", "sec_uid", "ms_token"
 
 def safe_value(value: Any, depth: int = 0) -> Any:
     if depth >= 4:
-        return str(value)[:300]
+        return None  # Do not stringify unvisited structures containing secrets.
     if value is None or isinstance(value, (int, float, bool)):
         return value
     if isinstance(value, str):
@@ -63,7 +67,17 @@ def safe_value(value: Any, depth: int = 0) -> Any:
             )
         except Exception:
             pass
-    return str(value)[:1000]
+    return "<unsupported>"
+
+
+def avatar_url(user: Any) -> str | None:
+    for name in ("avatar_thumb", "avatar_medium", "avatar_large"):
+        image = getattr(user, name, None)
+        urls = image.get("url_list", []) if isinstance(image, dict) else getattr(image, "url_list", [])
+        for url in urls or []:
+            if isinstance(url, str) and url.startswith(("https://", "http://")):
+                return url
+    return None
 
 
 def event_user(event: Any) -> dict[str, Any] | None:
@@ -74,6 +88,7 @@ def event_user(event: Any) -> dict[str, Any] | None:
         "unique_id": getattr(user, "unique_id", None),
         "nickname": getattr(user, "nickname", None),
         "user_id": str(getattr(user, "id", "") or "") or None,
+        "avatar_url": avatar_url(user),
     }
 
 
@@ -122,22 +137,6 @@ class Broadcaster:
 broadcaster = Broadcaster()
 
 
-SAFETY_EVENTS = {
-    "BottomEvent": ("bottom_notice", "high"),
-    "PerceptionEvent": ("perception", "high"),
-    "PartnershipPunishEvent": ("partnership_punish", "high"),
-    "RoomVerifyEvent": ("room_verify", "high"),
-    "GiftDynamicRestrictionEvent": ("gift_restriction", "high"),
-    "AccessControlEvent": ("access_control", "medium"),
-    "GiftPromptEvent": ("gift_prompt", "medium"),
-    "NoticeEvent": ("notice", "info"),
-    "RoomNotifyEvent": ("room_notify", "info"),
-    "SystemEvent": ("system", "info"),
-    "InRoomBannerEvent": ("in_room_banner", "info"),
-    "ToastEvent": ("toast", "info"),
-    "AccessRecallEvent": ("access_recall", "info"),
-}
-
 
 @dataclass
 class LiveSession:
@@ -158,6 +157,9 @@ class LiveSession:
     dedup_order: deque = field(default_factory=lambda: deque(maxlen=4000))
     dedup_set: set[str] = field(default_factory=set)
 
+    recent_safety_signals: deque = field(default_factory=lambda: deque(maxlen=50))
+    diagnostic_fingerprints: dict[str, int] = field(default_factory=dict)
+
     participants: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     state: dict[str, Any] = field(default_factory=dict)
@@ -167,7 +169,7 @@ class LiveSession:
 
     def __post_init__(self):
         if self.profile_name not in {"raw", "dance", "kite"}:
-            self.profile_name = "raw"
+            raise ValueError("Unknown profile")
         profile = get_profile(self.profile_name)
         self.rules = validate_rules(profile["rules"])
         self.config = {
@@ -176,7 +178,7 @@ class LiveSession:
             "follow_enabled": True,
             "share_enabled": True,
             "gift_enabled": True,
-            "safety_auto_pause_high": True,
+            "safety_auto_pause_critical": True,
             "count_simulations_in_stats": False,
         }
         self.stats = {
@@ -188,6 +190,12 @@ class LiveSession:
             "gift_coins": 0,
             "subscriptions": 0,
             "diagnostics": 0,
+            "diagnostic_info": 0,
+            "diagnostic_historical": 0,
+            "diagnostic_observation": 0,
+            "diagnostic_alert": 0,
+            "diagnostic_critical": 0,
+            "diagnostic_suppressed": 0,
             "simulations": 0,
         }
         self.state = {
@@ -206,6 +214,7 @@ class LiveSession:
             "reconnects": 0,
             "safety_state": "NORMAL",
             "last_safety_event": None,
+            "last_monitor_event": None,
             "created_at": now_ms(),
             "connected_at": None,
         }
@@ -250,6 +259,7 @@ class LiveSession:
             "comments": 0, "likes": 0, "follows": 0,
             "shares": 0, "gifts": 0, "coins": 0,
         })
+        p.update({k: user.get(k) for k in ("unique_id", "nickname", "user_id", "avatar_url")})
         typ = event["type"]
         if typ == "comment":
             p["comments"] += 1
@@ -294,7 +304,7 @@ class LiveSession:
         data: dict[str, Any] | None = None,
         *,
         source: str = "tiktok",
-        safety_severity: str | None = None,
+        safety_meta: dict[str, Any] | None = None,
         dedup_key: str | None = None,
     ) -> dict[str, Any] | None:
         if source == "tiktok" and self._seen(dedup_key):
@@ -317,18 +327,47 @@ class LiveSession:
                 "actions": [],
             }
 
-            if safety_severity:
-                self.stats["diagnostics"] += 1
-                item["safety"] = {"severity": safety_severity}
-                if safety_severity in {"medium", "high"}:
-                    self.state["safety_state"] = "ATTENTION"
-                    self.state["last_safety_event"] = item
-                if safety_severity == "high" and self.config.get("safety_auto_pause_high"):
-                    self.state["automation_paused"] = True
+            if safety_meta:
+                item["safety"] = dict(safety_meta)
+                level = str(safety_meta.get("level") or "INFO").upper()
+                # Additive compatibility for consumers of the v4.0 bridge.
+                item["safety"]["severity"] = (
+                    "high" if level == "CRITICAL" else
+                    "medium" if level in {"OBSERVATION", "ALERT"} else "info"
+                )
+                stat_key = {
+                    "INFO": "diagnostic_info",
+                    "HISTORICAL": "diagnostic_historical",
+                    "OBSERVATION": "diagnostic_observation",
+                    "ALERT": "diagnostic_alert",
+                    "CRITICAL": "diagnostic_critical",
+                }.get(level)
+                if stat_key:
+                    self.stats[stat_key] += 1
+                if level in {"OBSERVATION", "ALERT", "CRITICAL"}:
+                    self.stats["diagnostics"] += 1
+                    self.state["last_monitor_event"] = item
+                    current_rank = LEVEL_RANK.get(self.state.get("safety_state", "NORMAL"), 0)
+                    new_rank = LEVEL_RANK.get(level, 0)
+                    if new_rank >= current_rank:
+                        self.state["safety_state"] = level
+                    if level in {"ALERT", "CRITICAL"}:
+                        self.state["last_safety_event"] = item
+                    if (
+                        level == "CRITICAL"
+                        and safety_meta.get("auto_pause")
+                        and self.config.get("safety_auto_pause_critical")
+                    ):
+                        self.state["automation_paused"] = True
 
+            item["schema_version"] = 1
+            item["automation_paused_at_ingest"] = self.state["automation_paused"]
             gameplay_type = typ in {"comment", "like", "follow", "share", "gift", "subscription"}
             if gameplay_type and not self.state["automation_paused"]:
-                item["actions"] = actions_for(self.rules, item)
+                try:
+                    item["actions"] = actions_for(self.rules, item)
+                except (ValueError, TypeError, OverflowError):
+                    log.exception("Invalid rule execution in session %s", self.session_id)
 
             self._update_stats(item, simulated)
             self._update_participant(item, simulated)
@@ -347,6 +386,88 @@ class LiveSession:
             "event_class": event.__class__.__name__,
             "payload": safe_value(event),
         }
+
+    def _find_corroborating_signal(self, typ: str, received_at: int) -> str | None:
+        window_ms = int(settings.diagnostic_corroboration_seconds * 1000)
+        while self.recent_safety_signals and received_at - self.recent_safety_signals[0][0] > window_ms:
+            self.recent_safety_signals.popleft()
+        for ts, other_type, level in reversed(self.recent_safety_signals):
+            if other_type != typ and level in {"ALERT", "CRITICAL"}:
+                return other_type
+        return None
+
+    def _repeat_suppressed(self, typ: str, level: str, payload: Any, received_at: int) -> bool:
+        ttl_ms = int(settings.diagnostic_repeat_suppress_seconds * 1000)
+        fingerprint = content_fingerprint(typ, level, payload)
+        previous = self.diagnostic_fingerprints.get(fingerprint)
+        self.diagnostic_fingerprints[fingerprint] = received_at
+        # Opportunistic cleanup so this dict stays bounded.
+        if len(self.diagnostic_fingerprints) > 500:
+            cutoff = received_at - max(ttl_ms * 3, 60_000)
+            self.diagnostic_fingerprints = {
+                k: v for k, v in self.diagnostic_fingerprints.items() if v >= cutoff
+            }
+        return previous is not None and received_at - previous <= ttl_ms
+
+    async def process_diagnostic(self, event: Any, typ: str, policy: str):
+        received_at = now_ms()
+        payload = safe_value(event)
+        raw = {"event_class": event.__class__.__name__}
+        if settings.store_raw_diagnostics:
+            raw["payload"] = payload
+        meaningful = payload_has_meaningful_content(payload)
+        event_time = extract_event_time_ms(event)
+
+        preliminary = classify_diagnostic(
+            policy=policy,
+            connected_at_ms=self.state.get("connected_at"),
+            received_at_ms=received_at,
+            event_time_ms=event_time,
+            meaningful=meaningful,
+            historical_grace_ms=int(settings.diagnostic_historical_grace_seconds * 1000),
+            fresh_max_age_ms=int(settings.diagnostic_fresh_max_seconds * 1000),
+            startup_quarantine_ms=int(settings.diagnostic_startup_quarantine_seconds * 1000),
+        )
+
+        # Info messages carrying only common transport fields are pure noise (e.g. banner storms).
+        if preliminary["level"] == "INFO" and not meaningful:
+            self.stats["diagnostic_suppressed"] += 1
+            return None
+
+        corroborated_by = None
+        if preliminary["level"] == "ALERT":
+            corroborated_by = self._find_corroborating_signal(typ, received_at)
+
+        safety = classify_diagnostic(
+            policy=policy,
+            connected_at_ms=self.state.get("connected_at"),
+            received_at_ms=received_at,
+            event_time_ms=event_time,
+            meaningful=meaningful,
+            historical_grace_ms=int(settings.diagnostic_historical_grace_seconds * 1000),
+            fresh_max_age_ms=int(settings.diagnostic_fresh_max_seconds * 1000),
+            startup_quarantine_ms=int(settings.diagnostic_startup_quarantine_seconds * 1000),
+            corroborated_by=corroborated_by,
+        )
+
+        if self._repeat_suppressed(typ, safety["level"], payload, received_at):
+            self.stats["diagnostic_suppressed"] += 1
+            return None
+
+        if safety["level"] in {"ALERT", "CRITICAL"}:
+            self.recent_safety_signals.append((received_at, typ, safety["level"]))
+
+        raw["diagnostic_summary"] = {
+            "class": event.__class__.__name__,
+            "policy": policy,
+            "message_id": event_message_id(event),
+        }
+        return await self.push(
+            typ,
+            raw,
+            safety_meta=safety,
+            dedup_key=event_message_id(event),
+        )
 
     def _gift_diamonds(self, gift: Any) -> int:
         direct = getattr(gift, "diamond_count", None)
@@ -480,7 +601,7 @@ class LiveSession:
                 viewers = getattr(event, "total_user", None)
             if viewers is not None:
                 self.state["viewers"] = int(viewers)
-            await broadcaster.send({"kind": "status", "session": self.snapshot()})
+            await broadcaster.send({"kind": "status", "session": {"session_id": self.session_id, "viewers": self.state["viewers"]}})
 
         # Optional subscription event in TikTokLive 7.x.
         sub_cls = getattr(tt_events, "SubNotifyEvent", None)
@@ -493,29 +614,29 @@ class LiveSession:
                 )
             c.add_listener(sub_cls, on_sub)
 
-        # Diagnostic/compliance events. Optional imports avoid breaking when the schema changes.
-        for class_name, (typ, severity) in SAFETY_EVENTS.items():
+        # Diagnostic/compliance events are classified by freshness + payload content.
+        for class_name, spec in DIAGNOSTIC_EVENTS.items():
             cls = getattr(tt_events, class_name, None)
             if not cls:
                 continue
 
-            async def handler(event, _typ=typ, _severity=severity):
-                await self.push(
-                    _typ,
-                    self._raw_event(event),
-                    safety_severity=_severity,
-                    dedup_key=event_message_id(event),
-                )
+            async def handler(event, _typ=spec["type"], _policy=spec["policy"]):
+                await self.process_diagnostic(event, _typ, _policy)
             c.add_listener(cls, handler)
 
+        # Unknown events are summarized, not stored raw. This avoids leaking route/signing data
+        # and suppresses wrapper duplicates of messages already parsed by a typed listener.
         unknown_cls = getattr(tt_events, "UnknownEvent", None)
         if unknown_cls:
             async def on_unknown(event):
-                await self.push(
-                    "unknown",
-                    self._raw_event(event),
-                    dedup_key=event_message_id(event),
-                )
+                summary = summarize_unknown_payload(safe_value(event))
+                ids = summary.get("message_ids") or []
+                if ids and any(mid in self.dedup_set for mid in ids):
+                    self.stats["diagnostic_suppressed"] += 1
+                    return
+                if not summary.get("methods") and not ids:
+                    return
+                await self.push("unknown", {"event_class": "UnknownEvent", **summary})
             c.add_listener(unknown_cls, on_unknown)
 
     async def run(self):
@@ -558,7 +679,7 @@ class LiveSession:
                     "live": False,
                     "last_error": "User is not currently LIVE",
                 })
-                await broadcaster.send({"kind": "status", "session": self.snapshot()})
+                await broadcaster.send({"kind": "status", "session": {"session_id": self.session_id, "viewers": self.state["viewers"]}})
                 await asyncio.sleep(settings.offline_retry_seconds)
                 backoff = settings.reconnect_base_seconds
 
@@ -636,11 +757,10 @@ class LiveManager:
 
     async def connect(self, username: str, profile: str = "raw") -> tuple[LiveSession, bool]:
         username = clean_username(username)
+        get_profile(profile)  # Validate before creating or reusing a session.
         async with self.lock:
             for session in self.sessions.values():
                 if session.username.casefold() == username.casefold() and not session.stop_requested:
-                    if profile and profile != session.profile_name:
-                        session.apply_profile(profile)
                     return session, False
 
             if len(self.sessions) >= settings.max_sessions:

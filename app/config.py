@@ -26,11 +26,17 @@ class Settings:
     ignore_broken_payload: bool = _bool("IGNORE_BROKEN_PAYLOAD", True)
     store_raw_diagnostics: bool = _bool("STORE_RAW_DIAGNOSTICS", True)
 
+    diagnostic_historical_grace_seconds: float = float(os.getenv("DIAGNOSTIC_HISTORICAL_GRACE_SECONDS", "15"))
+    diagnostic_fresh_max_seconds: float = float(os.getenv("DIAGNOSTIC_FRESH_MAX_SECONDS", "120"))
+    diagnostic_startup_quarantine_seconds: float = float(os.getenv("DIAGNOSTIC_STARTUP_QUARANTINE_SECONDS", "20"))
+    diagnostic_corroboration_seconds: float = float(os.getenv("DIAGNOSTIC_CORROBORATION_SECONDS", "20"))
+    diagnostic_repeat_suppress_seconds: float = float(os.getenv("DIAGNOSTIC_REPEAT_SUPPRESS_SECONDS", "30"))
+
     auto_connect: str = os.getenv("AUTO_CONNECT_USERS", "").strip()
     euler_api_key: str = os.getenv("EULER_API_KEY", "").strip()
 
     render: bool = os.getenv("RENDER", "").lower() == "true"
-    app_version: str = "4.0.0"
+    app_version: str = "4.1.0"
 
 
 settings = Settings()

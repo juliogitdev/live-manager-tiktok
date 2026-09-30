@@ -1,5 +1,20 @@
 # TikTok → Roblox Live Manager v4.1
 
+O runtime foi consolidado em `app/`, com painel em `static/` e exemplo em `roblox/`.
+Consulte [DOCUMENTACAO_API_PYTHON.md](DOCUMENTACAO_API_PYTHON.md) para o contrato atual e
+[ANALISE_API_PYTHON.md](ANALISE_API_PYTHON.md) para correções e pendências. Registrar outra
+vez uma conta preserva suas regras; divergência de perfil aparece em `profile_conflict`.
+O bridge mantém o comportamento legado de expiração e oferece `recover=true` para
+recuperar o trecho ainda em memória. Não há recuperação durável após restart.
+
+Testes locais, sem conexão TikTok:
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+node --test tests/dashboard.test.cjs
+```
+
 Backend pronto para Render com painel web, múltiplas contas TikTok, monitor de diagnóstico, simulador e bridge robusto para Roblox.
 
 ## O que esta versão resolve

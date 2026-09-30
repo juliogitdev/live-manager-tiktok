@@ -1,9 +1,25 @@
 let sessions = [];
 let profiles = {};
 let eventCache = [];
+let diagnosticCache = [];
 let currentTab = "lives";
 let ws = null;
 let wsPing = null;
+let pollTimer = null;
+let reconnectTimer = null;
+let active = false;
+let generation = 0;
+let refreshPending = null;
+
+function stopDashboard(){
+  active = false;
+  generation++;
+  clearInterval(pollTimer); pollTimer = null;
+  clearInterval(wsPing); wsPing = null;
+  clearTimeout(reconnectTimer); reconnectTimer = null;
+  if(ws){ ws.onclose = null; ws.close(); ws = null; }
+  sessions = []; eventCache = []; diagnosticCache = [];
+}
 
 const $ = id => document.getElementById(id);
 const esc = value => {
@@ -35,7 +51,7 @@ async function authCheck() {
   hideLogin(); return true;
 }
 
-function showLogin(){ $("login").classList.remove("hidden"); }
+function showLogin(){ stopDashboard(); $("login").classList.remove("hidden"); }
 function hideLogin(){ $("login").classList.add("hidden"); }
 
 async function login(){
@@ -51,6 +67,7 @@ async function login(){
 }
 
 async function logout(){
+  stopDashboard();
   await fetch("/api/auth/logout",{method:"POST",credentials:"same-origin"});
   if(ws)ws.close(); showLogin();
 }
@@ -94,18 +111,25 @@ function renderProfileButtons(){
 }
 
 async function refresh(){
-  try{
-    const h=await fetch("/health").then(r=>r.json());
-    $("backendStatus").textContent="● Backend online";
-    $("backendStatus").className="badge green";
-    const d=await request("/api/live/sessions");
-    sessions=d.sessions||[];
-    renderSessions();
-    updateSessionSelects();
-  }catch(e){
-    $("backendStatus").textContent="● Backend/API indisponível";
-    $("backendStatus").className="badge red";
-  }
+  if(!active)return;
+  if(refreshPending)return refreshPending;
+  const epoch = generation;
+  refreshPending = (async()=>{
+    try{
+      const d=await request("/api/live/sessions");
+      if(!active || epoch!==generation)return;
+      $("backendStatus").textContent="● Backend online";
+      $("backendStatus").className="badge green";
+      sessions=d.sessions||[];
+      renderSessions(); updateSessionSelects();
+      if(currentTab==="monitor")renderMonitorState();
+    }catch(e){
+      if(!active || epoch!==generation)return;
+      $("backendStatus").textContent="● Backend/API indisponível";
+      $("backendStatus").className="badge red";
+    }
+  })();
+  try { await refreshPending; } finally { refreshPending = null; }
 }
 
 function renderSessions(){
@@ -190,22 +214,41 @@ function renderCachedEvents(){
   $("eventList").innerHTML=rows.map(eventHtml).join("")||`<div class="muted">Sem eventos.</div>`;
 }
 
+function ageText(ms){
+  if(ms===null||ms===undefined)return "tempo desconhecido";
+  const abs=Math.abs(ms);
+  if(abs<1000)return `${Math.round(abs)} ms`;
+  if(abs<60000)return `${(abs/1000).toFixed(1)} s`;
+  if(abs<3600000)return `${Math.floor(abs/60000)} min ${Math.floor((abs%60000)/1000)} s`;
+  return `${Math.floor(abs/3600000)} h ${Math.floor((abs%3600000)/60000)} min`;
+}
+
 function eventHtml(e){
   const data=e.data||{},u=data.user?.unique_id||"";
   let detail="";
   if(e.type==="comment")detail=data.comment||"";
   else if(e.type==="gift")detail=`${data.gift?.name||"Gift"} ×${data.repeat_count||1} · ${data.gift?.diamond_count||0} moedas cada`;
   else if(e.type==="like")detail=`+${data.count||1}`;
-  else if(isDiagnostic(e.type))detail=e.safety?.severity?`severidade: ${e.safety.severity}`:"";
   const actions=(e.actions||[]).map(a=>a.type+(a.name?`:${a.name}`:"")).join(", ");
-  const sev=e.safety?.severity?`sev-${e.safety.severity}`:"";
+  const safety=e.safety||null;
+  const level=safety?.level||"";
+  const levelClass=level?`level-${level.toLowerCase()}`:"";
+  const diagnosticMeta=safety?`
+    <div class="diagnostic-meta">
+      <span class="level-pill ${levelClass}">${esc(level)}</span>
+      <span>${esc(safety.freshness||"")}</span>
+      <span>confiança: ${esc(safety.confidence||"-")}</span>
+      ${safety.age_ms!==null&&safety.age_ms!==undefined?`<span>idade: ${ageText(safety.age_ms)}</span>`:""}
+    </div>
+    <div class="diagnostic-reason">${esc(safety.reason||"")}</div>`:"";
   const payload=isDiagnostic(e.type)&&e.data?.payload
     ? `<details><summary>Ver payload sanitizado</summary><pre>${esc(JSON.stringify(e.data.payload,null,2))}</pre></details>`
     : "";
-  return `<div class="event ${sev}">
+  return `<div class="event ${levelClass}">
     <strong>${e.source==="simulation"?"[TESTE] ":""}${esc(e.type)}</strong>
     ${u?` @${esc(u)} · `:""}${esc(detail)}
     <small>${new Date(e.timestamp).toLocaleTimeString()}</small>
+    ${diagnosticMeta}
     ${actions?`<div class="actions">Ações: ${esc(actions)}</div>`:""}
     ${payload}
   </div>`;
@@ -213,7 +256,15 @@ function eventHtml(e){
 
 async function loadMonitor(){
   const id=$("eventSession").value||sessions[0]?.session_id;if(!id)return;
-  const s=await request(`/api/live/${id}/status`);
+  renderMonitorState();
+  const d=await request(`/api/live/${id}/events?after=0&limit=500`);
+  diagnosticCache=(d.events||[]).filter(e=>isDiagnostic(e.type));
+  renderDiagnostics();
+}
+
+function renderMonitorState(){
+  const id=$("eventSession").value||sessions[0]?.session_id;
+  const s=sessions.find(s=>s.session_id===id);if(!s)return;
   $("monitorState").innerHTML=`
     <p>Conexão: <strong>${esc(s.connection_state)}</strong></p>
     <p>TikTok LIVE: <strong>${s.live?"ativa":"offline"}</strong></p>
@@ -221,10 +272,23 @@ async function loadMonitor(){
     <p>Automações: <strong>${s.automation_paused?"PAUSADAS":"ativas"}</strong></p>
     <p>Monitor: <strong>${esc(s.safety_state)}</strong></p>
     <p>Último erro: ${esc(s.last_error||"nenhum")}</p>`;
+  const st=s.stats||{};
+  $("monitorCounts").innerHTML=`
+    <div><span>Observação</span><b>${st.diagnostic_observation||0}</b></div>
+    <div><span>Alerta</span><b>${st.diagnostic_alert||0}</b></div>
+    <div><span>Crítico</span><b>${st.diagnostic_critical||0}</b></div>
+    <div><span>Histórico</span><b>${st.diagnostic_historical||0}</b></div>
+    <div><span>Suprimidos</span><b>${st.diagnostic_suppressed||0}</b></div>`;
   $("safetyBanner").classList.toggle("hidden",!s.automation_paused);
-  $("safetyBanner").textContent=s.automation_paused?"Alerta de alta severidade detectado: ações automáticas estão pausadas até revisão manual.":"";
-  const d=await request(`/api/live/${id}/events?after=0&limit=500`);
-  $("diagnostics").innerHTML=(d.events||[]).filter(e=>isDiagnostic(e.type)).reverse().map(eventHtml).join("")||`<div class="muted">Nenhum sinal registrado.</div>`;
+  $("safetyBanner").textContent=s.automation_paused?"Diagnóstico CRÍTICO confirmado: ações automáticas estão pausadas até revisão manual.":"";
+}
+
+function renderDiagnostics(){
+  const mode=$("monitorFilter")?.value||"relevant";
+  let rows=diagnosticCache.slice().reverse();
+  if(mode==="relevant")rows=rows.filter(e=>["OBSERVATION","ALERT","CRITICAL"].includes(e.safety?.level));
+  else if(mode==="history")rows=rows.filter(e=>["HISTORICAL","INFO"].includes(e.safety?.level));
+  $("diagnostics").innerHTML=rows.map(eventHtml).join("")||`<div class="muted">Nenhum sinal neste filtro.</div>`;
 }
 
 async function resetSafety(){
@@ -240,7 +304,7 @@ async function loadRules(){
   $("cfgFollow").checked=!!s.config.follow_enabled;
   $("cfgShare").checked=!!s.config.share_enabled;
   $("cfgGift").checked=!!s.config.gift_enabled;
-  $("cfgSafety").checked=!!s.config.safety_auto_pause_high;
+  $("cfgSafety").checked=!!s.config.safety_auto_pause_critical;
   $("rulesJson").value=JSON.stringify(s.rules,null,2);
 }
 
@@ -249,7 +313,7 @@ async function saveConfig(){
   await request(`/api/live/${id}/config`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:{
     comment_enabled:$("cfgComment").checked,like_enabled:$("cfgLike").checked,
     follow_enabled:$("cfgFollow").checked,share_enabled:$("cfgShare").checked,
-    gift_enabled:$("cfgGift").checked,safety_auto_pause_high:$("cfgSafety").checked
+    gift_enabled:$("cfgGift").checked,safety_auto_pause_critical:$("cfgSafety").checked
   }})});
   alert("Configuração salva.");
 }
@@ -291,32 +355,52 @@ function exportJson(){const id=$("eventSession").value;if(id)location.href=`/api
 function exportCsv(){const id=$("eventSession").value;if(id)location.href=`/api/live/${id}/export.csv`}
 
 function connectWs(){
-  if(ws)try{ws.close()}catch{}
+  if(!active)return;
+  if(ws){ws.onclose=null;ws.close()}
+  const epoch=generation;
   const proto=location.protocol==="https:"?"wss":"ws";
   ws=new WebSocket(`${proto}://${location.host}/ws`);
   ws.onopen=()=>{
+    if(!active || epoch!==generation)return;
     clearInterval(wsPing);
     // Render Free counts inbound WS messages as activity, so the dashboard pings while open.
     wsPing=setInterval(()=>{if(ws?.readyState===1)ws.send("ping")},30000);
   };
   ws.onmessage=ev=>{
+    if(!active || epoch!==generation)return;
     if(ev.data==="pong")return;
     let m;try{m=JSON.parse(ev.data)}catch{return}
     if(m.kind==="event"){
       if(currentTab==="events" && m.event.session_id===$("eventSession").value){
         eventCache.push(m.event);if(eventCache.length>500)eventCache.shift();renderCachedEvents();
       }
-      if(currentTab==="monitor"&&isDiagnostic(m.event.type))loadMonitor();
-      if(["gift","comment","like","follow","share"].includes(m.event.type))refresh();
-    } else if(m.kind==="status") refresh();
+      if(currentTab==="monitor" && isDiagnostic(m.event.type) && m.event.session_id===($("eventSession").value||sessions[0]?.session_id)){
+        diagnosticCache.push(m.event);if(diagnosticCache.length>500)diagnosticCache.shift();renderDiagnostics();
+      }
+    } else if(m.kind==="status"){
+      const s=sessions.find(s=>s.session_id===m.session.session_id);
+      if(s)Object.assign(s,m.session);
+      renderSessions();if(currentTab==="monitor")renderMonitorState();
+    }
   };
-  ws.onclose=()=>{clearInterval(wsPing);setTimeout(connectWs,3500)};
+  ws.onclose=()=>{
+    if(!active || epoch!==generation)return;
+    clearInterval(wsPing);clearTimeout(reconnectTimer);
+    reconnectTimer=setTimeout(connectWs,3500);
+  };
 }
 
 async function boot(){
-  if(!(await authCheck()))return;
-  await loadMeta();renderFavorites();await refresh();connectWs();
-  setInterval(refresh,5000);
+  stopDashboard();
+  const epoch=generation;
+  if(!(await authCheck()) || epoch!==generation)return;
+  active=true;
+  await loadMeta();
+  if(!active || epoch!==generation)return;
+  renderFavorites();await refresh();
+  if(!active || epoch!==generation)return;
+  connectWs();
+  pollTimer=setInterval(refresh,5000);
 }
 
 boot();

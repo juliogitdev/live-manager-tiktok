@@ -1,4 +1,5 @@
 from copy import deepcopy
+import math
 from typing import Any
 
 ALLOWED_ACTIONS = {
@@ -91,7 +92,9 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
 
 
 def get_profile(name: str) -> dict[str, Any]:
-    key = name if name in BUILTIN_PROFILES else "raw"
+    if name not in BUILTIN_PROFILES:
+        raise ValueError("Unknown profile")
+    key = name
     return deepcopy(BUILTIN_PROFILES[key])
 
 
@@ -113,14 +116,33 @@ def validate_rules(rules: Any) -> list[dict[str, Any]]:
         actions = rule.get("actions") or []
         if not isinstance(when, dict) or not isinstance(actions, list):
             raise ValueError(f"invalid rule {rid}")
+        if set(when) - {"type", "gift_name", "min_count", "min_coins", "comment_contains"}:
+            raise ValueError("unknown condition")
+        for key in ("min_count", "min_coins"):
+            if key in when and (type(when[key]) is not int or not 0 <= when[key] <= 1000000000):
+                raise ValueError(f"{key} must be a nonnegative integer <= 1000000000")
+        for key in ("type", "gift_name", "comment_contains"):
+            if key in when and (not isinstance(when[key], str) or len(when[key]) > 2000):
+                raise ValueError(f"invalid {key}")
+        if when.get("type") and when["type"] not in {"gift", "comment", "like", "follow", "share", "subscription"}:
+            raise ValueError("unsupported event type")
+        if type(rule.get("enabled", True)) is not bool:
+            raise ValueError("enabled must be a boolean")
+        if len(actions) > 20:
+            raise ValueError("maximum of 20 actions per rule")
         checked_actions = []
         for action in actions[:20]:
             if not isinstance(action, dict):
-                continue
+                raise ValueError("action must be an object")
             atype = str(action.get("type") or "").strip()
             if atype not in ALLOWED_ACTIONS:
                 raise ValueError(f"unsupported action type: {atype}")
-            checked_actions.append(dict(action))
+            for key in ("amount_per_count", "amount", "duration", "scale", "speed"):
+                if key in action:
+                    value = action[key]
+                    if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > 1000000000:
+                        raise ValueError(f"invalid numeric action field: {key}")
+            checked_actions.append(deepcopy(action))
         out.append({
             "id": rid,
             "enabled": bool(rule.get("enabled", True)),

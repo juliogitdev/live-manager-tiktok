@@ -142,8 +142,10 @@ local function handleEvent(event)
 		return
 	end
 
-	if event.safety and event.safety.severity == "high" then
-		warn("TikTok monitor: sinal de alta severidade. Backend pode pausar ações.")
+	if event.safety and event.safety.level == "CRITICAL" then
+		warn("TikTok monitor: sinal CRÍTICO confirmado. Backend pode pausar ações.")
+	elseif event.safety and event.safety.level == "ALERT" then
+		warn("TikTok monitor: sinal em ALERTA; automação segue ativa até confirmação.")
 	end
 
 	for _, action in ipairs(event.actions or {}) do

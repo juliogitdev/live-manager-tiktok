@@ -101,11 +101,21 @@
         <div class="card">
           <h3>Estado da sessão</h3>
           <div id="monitorState"></div>
-          <button class="primary" onclick="resetSafety()">Liberar automações / resetar alerta</button>
+          <div id="monitorCounts" class="monitor-counts"></div>
+          <button class="primary" onclick="resetSafety()">Liberar automações / resetar monitor</button>
         </div>
         <div class="card">
-          <h3>Eventos de diagnóstico</h3>
-          <p class="muted">Sinais servem para diagnóstico e pausa conservadora, não para contornar moderação.</p>
+          <div class="row between">
+            <div>
+              <h3>Eventos de diagnóstico</h3>
+              <p class="muted">Mensagens antigas e banners vazios não pausam o jogo.</p>
+            </div>
+            <select id="monitorFilter" onchange="renderDiagnostics()" class="compact-select">
+              <option value="relevant">Relevantes</option>
+              <option value="all">Todos registrados</option>
+              <option value="history">Histórico / Info</option>
+            </select>
+          </div>
           <div id="diagnostics" class="feed compact"></div>
         </div>
       </div>
@@ -124,7 +134,7 @@
           <label><input id="cfgFollow" type="checkbox"> Follows ativos</label>
           <label><input id="cfgShare" type="checkbox"> Shares ativos</label>
           <label><input id="cfgGift" type="checkbox"> Presentes ativos</label>
-          <label><input id="cfgSafety" type="checkbox"> Pausar automações em alerta de alta severidade</label>
+          <label><input id="cfgSafety" type="checkbox"> Pausar automações somente em diagnóstico CRÍTICO confirmado</label>
           <button class="primary" onclick="saveConfig()">Salvar configuração</button>
         </div>
         <div class="card">

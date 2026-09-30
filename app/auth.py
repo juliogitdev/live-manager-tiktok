@@ -10,8 +10,17 @@ COOKIE_NAME = "live_manager_session"
 COOKIE_MAX_AGE = 7 * 24 * 60 * 60
 
 
+def validate_secrets():
+    if settings.render and (not settings.secret_key or not settings.api_key):
+        raise RuntimeError("Render requires SECRET_KEY and API_KEY")
+    if settings.dashboard_password and not (settings.secret_key or settings.api_key):
+        raise RuntimeError("Dashboard authentication requires SECRET_KEY or API_KEY")
+
+
 def _secret() -> bytes:
-    value = settings.secret_key or settings.api_key or "dev-secret-change-me"
+    value = settings.secret_key or settings.api_key
+    if not value:
+        raise RuntimeError("SECRET_KEY or API_KEY is required to sign cookies")
     return value.encode("utf-8")
 
 
@@ -28,7 +37,7 @@ def make_session_token() -> str:
 
 
 def verify_session_token(token: str | None) -> bool:
-    if not token or "." not in token:
+    if not (settings.secret_key or settings.api_key) or not token or "." not in token:
         return False
     body, sig = token.rsplit(".", 1)
     if not hmac.compare_digest(_sign(body.encode("ascii")), sig):
