@@ -12,9 +12,10 @@ A API key deve ficar SOMENTE no servidor. Nunca use este código como LocalScrip
 local HttpService = game:GetService("HttpService")
 
 local BASE_URL = "https://SEU-SERVICO.onrender.com"
-local API_KEY = "SUA_API_KEY"
+local API_KEY = "SEU_GAME_TOKEN_OU_API_KEY_LEGADA"
 local TIKTOK_USERNAME = "sua_conta"
 local PROFILE = "dance" -- raw | dance | kite
+local CONSUMER_ID = "roblox-main" -- igual ao consumer_id em GAME_TOKENS
 
 local LONG_POLL_SECONDS = 8
 local RETRY_SECONDS = 2
@@ -71,7 +72,8 @@ local function register()
 	local data, status, err = request("POST", "/api/bridge/register", {
 		username = TIKTOK_USERNAME,
 		profile = PROFILE,
-		consumer_id = game.JobId ~= "" and game.JobId or "roblox-studio",
+		consumer_id = CONSUMER_ID,
+		resume = true,
 	})
 
 	if not data then
@@ -81,8 +83,9 @@ local function register()
 
 	sessionId = data.session_id
 	cursor = data.cursor or 0
-	table.clear(processedIds)
-	table.clear(processedOrder)
+	if data.profile_conflict then
+		warn("Perfil solicitado difere do perfil ativo:", PROFILE, data.profile)
+	end
 
 	print("TikTok bridge registrado:", sessionId, "@" .. data.username, "perfil:", data.profile)
 	return true
@@ -170,10 +173,11 @@ while true do
 	end
 
 	local path = string.format(
-		"/api/bridge/%s/poll?after=%d&wait=%d&limit=100",
+		"/api/bridge/%s/poll?after=%d&wait=%d&limit=100&consumer_id=%s",
 		sessionId,
 		cursor,
-		LONG_POLL_SECONDS
+		LONG_POLL_SECONDS,
+		HttpService:UrlEncode(CONSUMER_ID)
 	)
 
 	local data, status, err = request("GET", path)
@@ -192,10 +196,18 @@ while true do
 	end
 
 	if data.cursor_expired then
-		-- Evita replay de presentes antigos quando o buffer já avançou.
-		cursor = data.cursor or data.latest_seq or cursor
-		warn("Cursor antigo expirou; avançando para o evento mais recente.")
-		continue
+		warn("Cursor expirado; recuperando o trecho ainda retido.")
+		local recovered = request("GET", path .. "&recover=true")
+		if recovered and not recovered.cursor_expired then
+			data = recovered
+		else
+			warn("Recuperação indisponível; perda de eventos registrada.")
+			cursor = data.cursor or data.latest_seq or cursor
+			continue
+		end
+	end
+	if data.gap_detected then
+		warn("Lacuna detectada antes do evento", data.oldest_seq)
 	end
 
 	for _, event in ipairs(data.events or {}) do
@@ -203,6 +215,14 @@ while true do
 	end
 
 	cursor = data.cursor or cursor
+	-- ACK só após aplicar efeitos e gravar deduplicação durável no jogo real.
+	local ack, ackStatus, ackError = request("POST", "/api/bridge/" .. sessionId .. "/ack", {
+		consumer_id = CONSUMER_ID,
+		cursor = cursor,
+	})
+	if not ack then
+		warn("Falha no ACK; o servidor poderá reenviar o lote:", ackStatus, ackError)
+	end
 
 	if data.automation_paused then
 		-- O backend continuará recebendo eventos, mas regras automáticas ficam sem ações.

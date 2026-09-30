@@ -161,12 +161,12 @@ function updateSessionSelects(){
   });
 }
 
-async function connectLive(usernameOverride){
+async function connectLive(usernameOverride,simulation=false){
   const username=(usernameOverride||$("username").value).trim();
   if(!username)return;
   try{
     await request("/api/live/connect",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({username,profile:$("connectProfile").value||"raw"})});
+      body:JSON.stringify({username,profile:$("connectProfile").value||"raw",simulation})});
     $("username").value="";await refresh();
   }catch(e){alert(e.message)}
 }
@@ -200,7 +200,7 @@ function isDiagnostic(type){
 async function loadEvents(){
   const id=$("eventSession").value;if(!id)return;
   try{
-    const d=await request(`/api/live/${id}/events?after=0&limit=500`);
+    const d=await request(`/api/live/${id}/events?tail=true&limit=500`);
     eventCache=d.events||[];renderCachedEvents();
   }catch{}
 }
@@ -257,7 +257,7 @@ function eventHtml(e){
 async function loadMonitor(){
   const id=$("eventSession").value||sessions[0]?.session_id;if(!id)return;
   renderMonitorState();
-  const d=await request(`/api/live/${id}/events?after=0&limit=500`);
+  const d=await request(`/api/live/${id}/events?tail=true&limit=500`);
   diagnosticCache=(d.events||[]).filter(e=>isDiagnostic(e.type));
   renderDiagnostics();
 }

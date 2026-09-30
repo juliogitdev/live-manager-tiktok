@@ -32,8 +32,8 @@ def api(monkeypatch):
 
 def test_deployed_version_and_assets(api):
     async def check(c):
-        assert (await c.get("/health")).json()["version"] == "4.1.0"
-        assert (await c.get("/api/meta")).json()["version"] == "4.1.0"
+        assert (await c.get("/health")).json()["version"] == "4.2.0"
+        assert (await c.get("/api/meta")).json()["version"] == "4.2.0"
         assert "monitorFilter" in (await c.get("/")).text
         assert "safety_auto_pause_critical" in (await c.get("/static/app.js")).text
     api(check)

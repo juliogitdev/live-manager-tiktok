@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import random
+from copy import deepcopy
 import time
 import uuid
 from collections import deque
@@ -8,7 +10,9 @@ from typing import Any
 
 from TikTokLive import TikTokLiveClient
 import TikTokLive.events as tt_events
-from TikTokLive.client.errors import UserOfflineError
+from TikTokLive.client.errors import UserOfflineError, SignatureRateLimitError
+from .broadcast import Broadcaster
+from .storage import EventStore
 
 from .config import settings
 from .rules import actions_for, get_profile, validate_rules
@@ -106,36 +110,7 @@ def event_message_id(event: Any) -> str | None:
     return None
 
 
-class Broadcaster:
-    def __init__(self):
-        self.clients: set[Any] = set()
-        self.lock = asyncio.Lock()
-
-    async def add(self, ws: Any):
-        async with self.lock:
-            self.clients.add(ws)
-
-    async def remove(self, ws: Any):
-        async with self.lock:
-            self.clients.discard(ws)
-
-    async def send(self, payload: dict[str, Any]):
-        async with self.lock:
-            clients = list(self.clients)
-        dead = []
-        for ws in clients:
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
-        if dead:
-            async with self.lock:
-                for ws in dead:
-                    self.clients.discard(ws)
-
-
-broadcaster = Broadcaster()
-
+broadcaster = Broadcaster(settings.ws_queue_size, settings.ws_send_timeout)
 
 
 @dataclass
@@ -143,6 +118,11 @@ class LiveSession:
     session_id: str
     username: str
     profile_name: str = "raw"
+    store: EventStore | None = None
+    simulation: bool = False
+    pinned: bool = False
+    last_activity: int = field(default_factory=now_ms)
+    retry_count: int = 0
 
     events: deque = field(default_factory=lambda: deque(maxlen=settings.max_events))
     seq: int = 0
@@ -219,14 +199,31 @@ class LiveSession:
             "connected_at": None,
         }
 
+    def oldest_seq(self):
+        if self.store:
+            return self.store.oldest(self.session_id, self.seq)
+        return self.events[0]["seq"] if self.events else self.seq + 1
+
+    def read_events(self, after, limit=500):
+        if self.store:
+            return self.store.read(self.session_id, after, limit)
+        return [e for e in self.events if e["seq"] > after][:limit]
+
+    def persist(self):
+        if self.store:
+            self.store.save(self)
+
     def snapshot(self) -> dict[str, Any]:
         return {
             **self.state,
+            "simulation": self.simulation,
+            "pinned": self.pinned,
+            "last_activity": self.last_activity,
             "stats": dict(self.stats),
             "config": dict(self.config),
             "rules": self.rules,
             "latest_seq": self.seq,
-            "oldest_seq": self.events[0]["seq"] if self.events else self.seq,
+            "oldest_seq": self.oldest_seq(),
             "queued_events": len(self.events),
             "participants": len(self.participants),
         }
@@ -307,12 +304,15 @@ class LiveSession:
         safety_meta: dict[str, Any] | None = None,
         dedup_key: str | None = None,
     ) -> dict[str, Any] | None:
-        if source == "tiktok" and self._seen(dedup_key):
+        if source == "tiktok" and dedup_key and (
+            dedup_key in self.dedup_set or (self.store and self.store.seen(self.session_id, dedup_key))
+        ):
             return None
 
         simulated = source == "simulation"
 
         async with self.lock:
+            before = (self.seq, deepcopy(self.state), dict(self.stats), deepcopy(self.participants))
             self.seq += 1
             item = {
                 "seq": self.seq,
@@ -372,8 +372,16 @@ class LiveSession:
             self._update_stats(item, simulated)
             self._update_participant(item, simulated)
 
-            self.events.append(item)
             self.state["last_event_at"] = item["timestamp"]
+            try:
+                if self.store:
+                    self.store.save(self, item, dedup_key if source == "tiktok" else None)
+            except Exception:
+                self.seq, self.state, self.stats, self.participants = before
+                raise
+            if source == "tiktok":
+                self._seen(dedup_key)
+            self.events.append(item)
             self.new_event.set()
 
         await broadcaster.send({"kind": "event", "event": item})
@@ -497,6 +505,7 @@ class LiveSession:
         @c.on(tt_events.ConnectEvent)
         async def on_connect(event):
             self.ended_recently = False
+            self.retry_count = 0
             self.state.update({
                 "connection_state": "connected",
                 "connected": True,
@@ -639,85 +648,92 @@ class LiveSession:
                 await self.push("unknown", {"event_class": "UnknownEvent", **summary})
             c.add_listener(unknown_cls, on_unknown)
 
+    def retry_delay(self, offline=False, rate_limit=None):
+        base = settings.offline_retry_seconds if offline else settings.reconnect_base_seconds
+        ceiling = settings.offline_max_seconds if offline else settings.reconnect_max_seconds
+        delay = min(ceiling, base * 2 ** min(self.retry_count, 16))
+        self.retry_count += 1
+        delay = random.uniform(delay * .8, delay)
+        if rate_limit is not None:
+            # Never retry before the provider's Retry-After/reset deadline.
+            delay = max(delay, rate_limit) + random.uniform(0, base)
+        return delay
+
     async def run(self):
-        backoff = settings.reconnect_base_seconds
-        while not self.stop_requested:
-            try:
-                self.state["connection_state"] = "connecting"
-                self.state["last_error"] = None
-
-                self.client = TikTokLiveClient(unique_id=f"@{self.username}")
-                self.client.ignore_broken_payload = settings.ignore_broken_payload
-                self.register_handlers()
-
-                log.info("Connecting @%s", self.username)
-                await self.client.connect(
-                    fetch_room_info=True,
-                    fetch_gift_info=True,
-                    fetch_live_check=True,
-                )
-
-                if self.stop_requested:
-                    break
-
-                self.state["connected"] = False
-                self.state["reconnects"] += 1
-
-                if self.ended_recently or not self.state.get("live"):
-                    self.state["connection_state"] = "offline"
-                    await asyncio.sleep(settings.offline_retry_seconds)
-                    backoff = settings.reconnect_base_seconds
-                else:
-                    self.state["connection_state"] = "reconnecting"
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, settings.reconnect_max_seconds)
-
-            except UserOfflineError:
-                self.state.update({
-                    "connection_state": "offline",
-                    "connected": False,
-                    "live": False,
-                    "last_error": "User is not currently LIVE",
-                })
-                await broadcaster.send({"kind": "status", "session": {"session_id": self.session_id, "viewers": self.state["viewers"]}})
-                await asyncio.sleep(settings.offline_retry_seconds)
-                backoff = settings.reconnect_base_seconds
-
-            except asyncio.CancelledError:
-                break
-
-            except Exception as exc:
-                self.state["connected"] = False
-                self.state["connection_state"] = "error"
-                self.state["last_error"] = f"{type(exc).__name__}: {exc}"
-                self.state["reconnects"] += 1
-                await self.push("connection_error", {"message": self.state["last_error"]})
-                log.exception("Connection failure @%s", self.username)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, settings.reconnect_max_seconds)
-
-            finally:
-                if self.client:
+        if self.simulation:
+            return
+        try:
+            while not self.stop_requested:
+                delay = settings.reconnect_base_seconds
+                try:
+                    self.state.update(connection_state="connecting", last_error=None)
+                    self.client = TikTokLiveClient(unique_id=f"@{self.username}")
+                    self.client.ignore_broken_payload = settings.ignore_broken_payload
+                    self.register_handlers()
+                    await self.client.connect(fetch_room_info=True, fetch_gift_info=True, fetch_live_check=True)
+                    if self.stop_requested:
+                        break
+                    offline = self.ended_recently or not self.state.get("live")
+                    self.state["connection_state"] = "offline" if offline else "reconnecting"
+                    delay = self.retry_delay(offline=offline)
+                except UserOfflineError:
+                    self.state.update(connection_state="offline", live=False, last_error="User is not currently LIVE")
+                    delay = self.retry_delay(offline=True)
+                except SignatureRateLimitError as exc:
+                    response = getattr(exc, "response", None)
+                    headers = response.headers if response is not None else {}
+                    minimum = settings.offline_max_seconds
+                    from email.utils import parsedate_to_datetime
                     try:
-                        await self.client.disconnect(close_client=True)
-                    except Exception:
+                        raw = headers.get("Retry-After")
+                        if raw is not None:
+                            try:
+                                minimum = max(0, float(raw))
+                            except ValueError:
+                                minimum = max(0, parsedate_to_datetime(raw).timestamp() - time.time())
+                        elif headers.get("RateLimit-Reset"):
+                            minimum = max(0, float(headers["RateLimit-Reset"]) - time.time())
+                        else:
+                            minimum = max(0, float(exc.retry_after))
+                    except (ValueError, TypeError, AttributeError):
                         pass
-
-        self.state.update({"connection_state": "stopped", "connected": False})
+                    self.state.update(connection_state="rate_limited", last_error="Signing service rate limit")
+                    delay = self.retry_delay(rate_limit=minimum)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Error text can contain signing URLs/credentials; expose the class only.
+                    self.state.update(connection_state="error", last_error=type(exc).__name__)
+                    await self.push("connection_error", {"message": type(exc).__name__})
+                    log.warning("Connection failure @%s (%s)", self.username, type(exc).__name__)
+                    delay = self.retry_delay()
+                finally:
+                    self.state["connected"] = False
+                    if self.client:
+                        try:
+                            await asyncio.wait_for(self.client.disconnect(close_client=True), 5)
+                        except (Exception, asyncio.CancelledError):
+                            pass
+                        self.client = None
+                self.state["reconnects"] += 1
+                self.state["next_retry_at"] = now_ms() + int(delay * 1000)
+                await broadcaster.send({"kind": "status", "session": {
+                    k: self.state[k] for k in ("session_id", "connection_state", "connected", "last_error")}})
+                await asyncio.sleep(delay)
+        finally:
+            self.state.update(connection_state="stopped", connected=False)
 
     async def stop(self):
         self.stop_requested = True
-        if self.client and self.client.connected:
-            try:
-                await self.client.disconnect(close_client=True)
-            except Exception:
-                pass
         if self.task and not self.task.done():
             self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+        self.task = None
+        self.state.update(connection_state="stopped", connected=False)
 
     async def wait_for_events(self, after: int, wait_seconds: float) -> list[dict[str, Any]]:
         def collect():
-            return [e for e in self.events if e["seq"] > after]
+            return self.read_events(after)
 
         found = collect()
         if found or wait_seconds <= 0:
@@ -739,9 +755,11 @@ class LiveSession:
         self.profile_name = profile_name if profile_name in {"raw", "dance", "kite"} else "raw"
         self.rules = validate_rules(profile["rules"])
         self.state["profile"] = self.profile_name
+        self.persist()
 
     def set_rules(self, rules: Any):
         self.rules = validate_rules(rules)
+        self.persist()
 
     def leaderboard(self, sort_by: str = "coins", limit: int = 50) -> list[dict[str, Any]]:
         allowed = {"coins", "gifts", "likes", "comments", "shares", "follows"}
@@ -751,62 +769,115 @@ class LiveSession:
 
 
 class LiveManager:
-    def __init__(self):
+    def __init__(self, store=None):
         self.sessions: dict[str, LiveSession] = {}
         self.lock = asyncio.Lock()
+        self.store = store
 
-    async def connect(self, username: str, profile: str = "raw") -> tuple[LiveSession, bool]:
+    def restore(self):
+        if not self.store:
+            return
+        self.store.prune()
+        for snap in self.store.snapshots():
+            s = LiveSession(snap["session_id"], snap["username"], snap["profile"], store=self.store,
+                            simulation=snap.get("simulation", False), pinned=snap.get("pinned", False))
+            s.seq = snap["latest_seq"]
+            s.state.update({key: snap[key] for key in s.state if key in snap})
+            s.state.update(connected=False, live=False, connection_state="dormant")
+            s.stats.update(snap["stats"])
+            s.config.update(snap["config"])
+            s.rules = validate_rules(snap["rules"])
+            s.participants = self.store.participants(s.session_id)
+            s.events.extend(self.store.read(s.session_id, max(0, s.seq - settings.max_events), settings.max_events))
+            s.last_activity = snap.get("last_activity", now_ms())
+            self.sessions[s.session_id] = s
+
+    def active_count(self):
+        return sum(bool(s.task and not s.task.done()) for s in self.sessions.values() if not s.simulation)
+
+    def activate(self, session):
+        session.last_activity = now_ms()
+        if session.simulation:
+            session.state["connection_state"] = "simulation"
+            return
+        if session.task and not session.task.done():
+            return
+        if self.active_count() >= settings.max_sessions:
+            raise RuntimeError(f"MAX_SESSIONS limit reached ({settings.max_sessions})")
+        session.stop_requested = False
+        session.task = asyncio.create_task(session.run())
+
+    async def connect(self, username, profile="raw", *, simulation=False, pinned=False):
         username = clean_username(username)
-        get_profile(profile)  # Validate before creating or reusing a session.
+        get_profile(profile)
         async with self.lock:
-            for session in self.sessions.values():
-                if session.username.casefold() == username.casefold() and not session.stop_requested:
-                    return session, False
-
-            if len(self.sessions) >= settings.max_sessions:
-                raise RuntimeError(f"MAX_SESSIONS limit reached ({settings.max_sessions})")
-
+            for s in self.sessions.values():
+                if s.username.casefold() == username.casefold() and s.simulation == simulation:
+                    self.activate(s)
+                    if pinned:
+                        s.pinned = True
+                    s.persist()
+                    return s, False
+            if len(self.sessions) >= settings.max_stored_sessions:
+                raise RuntimeError("Stored session limit reached")
+            if simulation and sum(s.simulation for s in self.sessions.values()) >= settings.max_simulations:
+                raise RuntimeError("Simulation session limit reached")
+            if not simulation and self.active_count() >= settings.max_sessions:
+                raise RuntimeError("MAX_SESSIONS limit reached")
             sid = uuid.uuid4().hex[:16]
-            session = LiveSession(sid, username, profile_name=profile or "raw")
-            self.sessions[sid] = session
-            session.task = asyncio.create_task(session.run())
-            return session, True
+            s = LiveSession(sid, username, profile, store=self.store, simulation=simulation, pinned=pinned)
+            s.persist()
+            self.sessions[sid] = s
+            self.activate(s)
+            return s, True
 
-    def get(self, session_id: str) -> LiveSession:
-        session = self.sessions.get(session_id)
-        if not session:
+    def get(self, session_id):
+        if session_id not in self.sessions:
             raise KeyError(session_id)
-        return session
+        return self.sessions[session_id]
 
-    async def disconnect(self, session_id: str):
+    async def disconnect(self, session_id):
         async with self.lock:
-            session = self.sessions.get(session_id)
-            if not session:
-                return
-            await session.stop()
-            self.sessions.pop(session_id, None)
+            s = self.sessions.get(session_id)
+            if s:
+                await s.stop()
+                if self.store:
+                    self.store.delete(session_id)
+                self.sessions.pop(session_id, None)
+
+    async def reap(self):
+        async with self.lock:
+            for s in list(self.sessions.values()):
+                idle = (now_ms() - s.last_activity) / 1000
+                if not s.pinned and idle > settings.consumer_timeout_seconds:
+                    await s.stop()
+                    s.state["connection_state"] = "dormant"
+                    s.persist()
+                    if idle > settings.retention_seconds:
+                        if self.store:
+                            self.store.delete(s.session_id)
+                        self.sessions.pop(s.session_id, None)
+            if self.store:
+                self.store.prune()
+
+    async def maintenance(self):
+        while True:
+            await asyncio.sleep(min(30, settings.consumer_timeout_seconds))
+            await self.reap()
 
     async def stop_all(self):
-        async with self.lock:
-            rows = list(self.sessions.values())
-        await asyncio.gather(*(s.stop() for s in rows), return_exceptions=True)
+        await asyncio.gather(*(s.stop() for s in self.sessions.values()))
+        for s in self.sessions.values():
+            s.persist()
 
     async def auto_connect(self):
-        raw = settings.auto_connect
-        if not raw:
-            return
-        for item in raw.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if ":" in item:
-                username, profile = item.split(":", 1)
-            else:
-                username, profile = item, "raw"
-            try:
-                await self.connect(username.strip(), profile.strip())
-            except Exception:
-                log.exception("AUTO_CONNECT failed for %s", item)
+        for s in list(self.sessions.values()):
+            if s.pinned:
+                self.activate(s)
+        for item in settings.auto_connect.split(","):
+            if item.strip():
+                username, _, profile = item.strip().partition(":")
+                await self.connect(username, profile or "raw", pinned=True)
 
 
 manager = LiveManager()

@@ -1,6 +1,23 @@
 # Revisão da API Python — correções e redução de custo
 
-## Resultado da implementação local — 30/09/2026
+## Resultado da implementação local v4.2 — 30/09/2026
+
+Esta seção prevalece sobre o resumo v4.1 e o relatório histórico abaixo. O código v4.2 está neste checkout; ainda não há deploy nem live real validada. Contrato: [DOCUMENTACAO_API_PYTHON.md](DOCUMENTACAO_API_PYTHON.md).
+
+| Problema restante na v4.1 | Implementação v4.2 |
+| --- | --- |
+| Lacunas, restart e presentes | Jornal SQLite com commit antes de publicar; sessão/ID de evento preservados no restart, deduplicação por ID de origem, retenção configurável, ACK por consumidor, `resume:true`, métricas de lacunas e atraso. Diagnósticos duráveis compactos não expulsam presentes por contagem. Persistência entre reinícios depende de disco real: `render.yaml` é Free/temporário; uma migração para disco pago fica para depois da validação. Não há recuperação de eventos que a API nunca recebeu. |
+| Credenciais | `GAME_TOKENS` limitados por conta/consumidor nas rotas do bridge, sem permissão administrativa; limite de login, Origin WS, remoção de chave na query, Secure explícito, segredos longos/independentes em produção e falha clara no startup. API key administrativa legada segue aceita para migração. Tokens rotacionam via configuração e restart. |
+| Sessões e reconexão | Hibernação após timeout sem consumidor, ID e histórico preservados, reativação na retomada, fixação administrativa opcional; backoff exponencial com jitter, reinício após conexão, respeito ao prazo do assinador e liberação do cliente antes de dormir. |
+| WS lento | Uma fila limitada e tarefa de envio por cliente, timeout, filtro opcional por `session_id`, coalescência de status e descarte de clientes lentos. `push()` não espera envio de socket. |
+| Simulação isolada | Sessão `simulation:true` separada, sem TikTokLiveClient nem vaga de conexão, disponível no painel. |
+| Contrato/testes | `schema_version:1`, modelos de resposta OpenAPI, limites profundos para regras, dependências fixadas e CI Python/Node. Fixture usa classe protobuf instalada para avatar. |
+
+Validação local: os testes cobrem restart em arquivo SQLite, retry/ACK, restauração de regras/ranking/pausa, isolamento de tokens, limpeza por inatividade, rate limit, Origin, filas lentas e simulação sem TikTok. Um ensaio local isolado gravou 500 presentes simulados em 0,38 s (~1.300 eventos/s, banco ~240 KiB); **não** é benchmark do Render nem medição de custo real. A integração do jogo precisa aplicar efeitos de modo idempotente. O plano Free do Render não oferece disco persistente ([documentação oficial](https://render.com/docs/disks)); a opção paga não está configurada neste repositório. A aplicação ainda não foi implantada nem testada com live real.
+
+---
+
+## Registro da implementação v4.1
 
 Versão final deste checkout: **4.1.0**, consolidada sobre o commit base abaixo. Sem novo commit ou deploy publicado. As seções numeradas posteriores preservam o diagnóstico histórico; esta tabela informa o estado após as correções. O contrato atualizado está em [DOCUMENTACAO_API_PYTHON.md](DOCUMENTACAO_API_PYTHON.md).
 

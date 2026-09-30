@@ -1,5 +1,6 @@
 from copy import deepcopy
 import math
+import json
 from typing import Any
 
 ALLOWED_ACTIONS = {
@@ -99,6 +100,31 @@ def get_profile(name: str) -> dict[str, Any]:
 
 
 def validate_rules(rules: Any) -> list[dict[str, Any]]:
+    def bounded(value, depth=0):
+        if depth > 8:
+            raise ValueError("rule nesting exceeds 8 levels")
+        if isinstance(value, dict):
+            if len(value) > 50 or any(not isinstance(k, str) or len(k) > 80 for k in value):
+                raise ValueError("invalid rule object size/keys")
+            for child in value.values():
+                bounded(child, depth + 1)
+        elif isinstance(value, list):
+            if len(value) > 100:
+                raise ValueError("rule array exceeds 100 items")
+            for child in value:
+                bounded(child, depth + 1)
+        elif isinstance(value, str):
+            if len(value) > 2000:
+                raise ValueError("rule text exceeds 2000 characters")
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not math.isfinite(value) or abs(value) > 1000000000:
+                raise ValueError("invalid rule number")
+        elif value is not None and not isinstance(value, bool):
+            raise ValueError("rule metadata must be JSON")
+
+    bounded(rules)
+    if len(json.dumps(rules, ensure_ascii=False).encode()) > 262144:
+        raise ValueError("rules exceed 256 KiB")
     if not isinstance(rules, list):
         raise ValueError("rules must be a list")
     if len(rules) > 100:
@@ -108,12 +134,16 @@ def validate_rules(rules: Any) -> list[dict[str, Any]]:
     for idx, rule in enumerate(rules):
         if not isinstance(rule, dict):
             raise ValueError(f"rule {idx} must be an object")
-        rid = str(rule.get("id") or f"rule_{idx}")[:80]
+        if set(rule) - {"id", "enabled", "when", "actions"}:
+            raise ValueError("unknown rule field")
+        rid = rule.get("id", f"rule_{idx}")
+        if not isinstance(rid, str) or not 1 <= len(rid) <= 80:
+            raise ValueError("invalid rule id")
         if rid in ids:
             raise ValueError(f"duplicate rule id: {rid}")
         ids.add(rid)
-        when = rule.get("when") or {}
-        actions = rule.get("actions") or []
+        when = rule.get("when", {})
+        actions = rule.get("actions", [])
         if not isinstance(when, dict) or not isinstance(actions, list):
             raise ValueError(f"invalid rule {rid}")
         if set(when) - {"type", "gift_name", "min_count", "min_coins", "comment_contains"}:
@@ -137,6 +167,10 @@ def validate_rules(rules: Any) -> list[dict[str, Any]]:
             atype = str(action.get("type") or "").strip()
             if atype not in ALLOWED_ACTIONS:
                 raise ValueError(f"unsupported action type: {atype}")
+            if set(action) - {"type", "name", "amount", "amount_per_count", "duration", "scale", "speed", "data"}:
+                raise ValueError("unknown action field; put custom metadata in data")
+            if "name" in action and not isinstance(action["name"], str):
+                raise ValueError("action name must be a string")
             for key in ("amount_per_count", "amount", "duration", "scale", "speed"):
                 if key in action:
                     value = action[key]

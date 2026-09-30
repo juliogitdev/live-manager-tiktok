@@ -1,13 +1,37 @@
-# TikTok → Roblox Live Manager v4.1
+# TikTok Live Manager v4.2
 
-O runtime foi consolidado em `app/`, com painel em `static/` e exemplo em `roblox/`.
-Consulte [DOCUMENTACAO_API_PYTHON.md](DOCUMENTACAO_API_PYTHON.md) para o contrato atual e
-[ANALISE_API_PYTHON.md](ANALISE_API_PYTHON.md) para correções e pendências. Registrar outra
-vez uma conta preserva suas regras; divergência de perfil aparece em `profile_conflict`.
-O bridge mantém o comportamento legado de expiração e oferece `recover=true` para
-recuperar o trecho ainda em memória. Não há recuperação durável após restart.
+API Python para compartilhar uma conexão TikTok LIVE entre painel e jogos. Normaliza presentes, comentários e likes; aplica perfis opcionais; oferece bridge HTTP com cursor, ACK por consumidor e retomada após restart com SQLite. Consulte o [contrato](DOCUMENTACAO_API_PYTHON.md) e o [relatório de correções](ANALISE_API_PYTHON.md). O [README v4.1](README_v4.1_HISTORICO.md) é histórico.
 
-Testes locais, sem conexão TikTok:
+## Início local
+
+Requer Python 3.11. No PowerShell, a partir da raiz:
+
+```powershell
+python -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+$env:API_KEY = "chave-administrativa-de-teste"
+$env:SECRET_KEY = "segredo-de-teste-diferente"
+$env:DASHBOARD_PASSWORD = "senha-de-teste"
+& .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Abra `http://127.0.0.1:8000`. O banco padrão é `data/live-manager.sqlite3`. Variáveis do `env.example` precisam ser exportadas; o servidor não lê `.env` automaticamente. Use **um worker e uma instância** para evitar conexões TikTok duplicadas.
+
+## Integração com jogos
+
+Configure `GAME_TOKENS` com token longo e escopo por conta/consumidor. O jogo registra `/api/bridge/register`, lê `/api/bridge/{sid}/poll` com cursor e confirma `/api/bridge/{sid}/ack` após gravar seus efeitos de forma idempotente. O [exemplo Roblox](roblox/TikTokBridge.server.lua) usa esse fluxo; em Electron, mantenha o token no processo principal e encaminhe eventos ao renderer por IPC restrito. Use `profile:"raw"` se as regras de gameplay estiverem no jogo. Sessões `simulation:true` exercitam o fluxo offline sem conexão TikTok.
+
+O servidor retém eventos por 24 horas por padrão, mas só pode recuperar eventos que recebeu e gravou. `gap_detected` indica perda fora da janela. O jogo ainda precisa deduplicar recompensas; ACK sozinho não garante efeitos exatamente uma vez.
+
+## Render
+
+O `render.yaml` padrão mantém o **plano Free**, sem disco persistente. Ele serve para testes, mas o SQLite local e os ACKs são perdidos quando o serviço reinicia, dorme ou recebe deploy, conforme a [documentação oficial](https://render.com/docs/free). Nesse caso, o jogo verá uma nova sessão e deve tratar a lacuna; não use a recuperação durável como garantia.
+
+Por enquanto, o repositório oferece apenas o Blueprint Free. Após validar o fluxo, a migração para um plano com disco persistente pode configurar `DATABASE_PATH` no volume para conservar eventos e ACKs entre reinícios. Configure `GAME_TOKENS` se usar token de jogo, e mantenha `SECRET_KEY` e `API_KEY` como segredos independentes.
+
+Não houve deploy nesta alteração. Após publicar, confirme `/health`, valide uma live real e verifique backups do banco antes de depender de presentes para recompensas.
+
+## Testes
 
 ```sh
 python -m pip install -r requirements-dev.txt
@@ -15,243 +39,4 @@ python -m pytest -q
 node --test tests/dashboard.test.cjs
 ```
 
-Backend pronto para Render com painel web, múltiplas contas TikTok, monitor de diagnóstico, simulador e bridge robusto para Roblox.
-
-## O que esta versão resolve
-
-- **Sem conta fixa no Render.** Conecte `@conta1`, `@conta2`, etc. pelo painel.
-- **Reutilização da mesma sessão.** Reiniciar o Roblox não abre outra conexão TikTok se a sessão continua viva.
-- **Recuperação automática após restart do Render.** O script Roblox detecta `404`, registra a sessão novamente e continua.
-- **Sem replay de gifts antigos ao reiniciar o Roblox.** O registro começa no cursor atual.
-- **Long polling.** Menos requests que polling a cada segundo e tráfego de entrada contínuo durante o jogo.
-- **Reconexão com backoff.** Contas offline não são marteladas a cada poucos segundos.
-- **Deduplicação por message/log ID quando disponível.**
-- **Gift streak correto.** Gifts de sequência só geram gameplay quando a sequência termina.
-- **Painel protegido por senha/cookie HttpOnly.**
-- **API key separada para Roblox.**
-- **Perfis e regras configuráveis.**
-- **Simulador gratuito de gifts/likes/comments/follows/shares.**
-- **Ranking por moedas, gifts, likes, comentários e shares.**
-- **Exportação JSON/CSV.**
-- **Monitor com severidade.** Alertas fortes podem pausar apenas as automações, sem perder o monitoramento.
-- **Eventos opcionais carregados dinamicamente**, reduzindo quebra quando o schema do TikTokLive muda.
-
-## Monitor de diagnóstico
-
-A v4.1 não classifica mais um evento como perigoso somente pelo nome da classe. O monitor usa:
-
-- timestamp interno do TikTok;
-- momento em que o backend conectou;
-- conteúdo real do payload;
-- deduplicação por `msgId`;
-- supressão de banners vazios/repetitivos;
-- corroboração entre tipos diferentes de sinal.
-
-Níveis:
-
-- `INFO`: informativo, não altera o monitor.
-- `HISTORICAL`: mensagem antiga/backlog recebida ao conectar; nunca pausa.
-- `OBSERVATION`: sinal atual mas fraco/vazio; nunca pausa.
-- `ALERT`: sinal atual com conteúdo relevante; requer revisão, mas não pausa sozinho.
-- `CRITICAL`: sinal forte atual e significativo, ou dois alertas diferentes corroborados; pode pausar automações.
-
-Por padrão, somente `CRITICAL` pausa ações automáticas. A conexão e o registro de eventos continuam ativos.
-
-Um `GiftDynamicRestrictionEvent` com `dynamicRestriction: {}` não é tratado como restrição confirmada. Se seu `createTime` for anterior à conexão, ele vira `HISTORICAL`; se for atual mas vazio, `OBSERVATION`.
-
-Banners informativos vazios como `InRoomBannerEvent` são suprimidos para não inflar o contador nem consumir o buffer.
-
-### Políticas por tipo
-
-**Strong:** `BottomEvent`, `PerceptionEvent`, `PartnershipPunishEvent`. Só viram `CRITICAL` diretamente quando atuais e com conteúdo.
-
-**Watch:** `GiftDynamicRestrictionEvent`, `RoomVerifyEvent`, `AccessControlEvent`, `GiftPromptEvent`. Um evento isolado não é crítico apenas pelo nome.
-
-**Info:** `NoticeEvent`, `RoomNotifyEvent`, `SystemEvent`, `InRoomBannerEvent`, `ToastEvent`, `AccessRecallEvent`.
-
-Parâmetros ajustáveis no Render:
-
-```env
-DIAGNOSTIC_HISTORICAL_GRACE_SECONDS=15
-DIAGNOSTIC_FRESH_MAX_SECONDS=120
-DIAGNOSTIC_STARTUP_QUARANTINE_SECONDS=20
-DIAGNOSTIC_CORROBORATION_SECONDS=20
-DIAGNOSTIC_REPEAT_SUPPRESS_SECONDS=30
-```
-
-## Perfis incluídos
-
-### `raw`
-Recebe eventos, mas não gera ações automáticas.
-
-### `dance`
-- comentário → `spawn`
-- follow → `aura`
-- Rose → `animation`
-- gift de 5+ moedas → `giant`
-
-### `kite`
-- comentário → `spawn`
-- likes → `heal`
-- follow/share → `shield`
-- Rose → `heal` + `attack`
-- gift de 5+ moedas → `giant`
-
-As regras podem ser alteradas no painel em **Regras**.
-
-## Deploy no Render
-
-### Opção recomendada: Blueprint
-
-1. Crie um repositório GitHub.
-2. Envie **todo o conteúdo deste ZIP** para a raiz do repositório.
-3. No Render: **New → Blueprint**.
-4. Escolha o repositório.
-5. O Render detectará `render.yaml`.
-6. Na criação, o Render solicitará `DASHBOARD_PASSWORD`.
-7. Clique em deploy.
-8. Depois do deploy, abra **Environment** e copie o valor de `API_KEY`.
-9. Abra `https://SEU-SERVICO.onrender.com`.
-10. Entre com `DASHBOARD_PASSWORD`.
-
-`API_KEY` e `SECRET_KEY` são geradas automaticamente pelo Blueprint.
-
-## Roblox
-
-Abra `roblox/TikTokBridge.server.lua` e altere:
-
-```lua
-local BASE_URL = "https://SEU-SERVICO.onrender.com"
-local API_KEY = "API_KEY_DO_RENDER"
-local TIKTOK_USERNAME = "sua_conta"
-local PROFILE = "dance"
-```
-
-Depois:
-
-1. Coloque o script em `ServerScriptService`.
-2. Roblox Studio → **Game Settings → Security**.
-3. Ative **Allow HTTP Requests**.
-4. Ligue os `ActionHandlers` às funções reais do seu jogo.
-
-O script:
-- registra/reutiliza a sessão;
-- começa no evento atual para não repetir presentes antigos;
-- usa long polling de 8 segundos;
-- detecta restart do backend;
-- registra uma nova sessão automaticamente;
-- deduplica IDs recentes localmente;
-- executa somente `actions` geradas pelas regras.
-
-## Render Free: comportamento importante
-
-O Render Free suspende Web Services depois de 15 minutos sem tráfego **de entrada**.
-
-Durante uma live com o Roblox conectado, o long polling gera tráfego de entrada regularmente e mantém o serviço ativo. Enquanto o dashboard está aberto, ele envia mensagens WebSocket periódicas ao backend.
-
-Uma conexão **saindo do Render para o TikTok**, sozinha, não deve ser considerada suficiente para manter o serviço acordado.
-
-Se não houver Roblox nem dashboard aberto, o Free pode suspender o processo.
-
-## AUTO_CONNECT_USERS
-
-Opcionalmente configure no Render:
-
-```env
-AUTO_CONNECT_USERS=conta1:dance,conta2:kite
-```
-
-Quando o processo iniciar novamente, essas sessões serão recriadas.
-
-Isso é útil porque o filesystem do Render Free é efêmero. A aplicação foi desenhada para funcionar sem depender de estado salvo em disco.
-
-## Estado e persistência
-
-Configurações e estatísticas da sessão ficam em memória. Se o processo reiniciar:
-
-- Roblox se registra novamente automaticamente;
-- `AUTO_CONNECT_USERS` pode recriar contas automaticamente;
-- estatísticas históricas zeram;
-- alterações manuais de regras da sessão zeram.
-
-Para histórico permanente, adicione banco externo/Postgres em uma próxima etapa. Isso **não é necessário para o gameplay funcionar**.
-
-## TikTokLive
-
-Esta versão fixa:
-
-```text
-TikTokLive==7.0.1
-```
-
-Isso evita que um update incompatível seja instalado automaticamente durante deploy.
-
-A biblioteca é não oficial e depende do Webcast interno do TikTok. Mudanças do TikTok podem exigir atualização futura.
-
-Ela usa um servidor de assinatura de terceiros com limites comunitários. Se você possuir uma chave compatível, pode configurar:
-
-```env
-EULER_API_KEY=...
-```
-
-Não é obrigatória para os primeiros testes.
-
-## Desenvolvimento local
-
-```bash
-python -m venv .venv
-```
-
-Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-
-$env:API_KEY="dev-key"
-$env:SECRET_KEY="dev-secret"
-$env:DASHBOARD_PASSWORD="senha"
-
-uvicorn app.main:app --reload
-```
-
-Abra:
-
-```text
-http://127.0.0.1:8000
-```
-
-## Endpoints principais
-
-Dashboard:
-- `GET /`
-- `GET /health`
-- `POST /api/auth/login`
-- `GET /api/live/sessions`
-- `POST /api/live/connect`
-- `GET /api/live/{id}/events`
-- `PUT /api/live/{id}/rules`
-- `POST /api/live/{id}/simulate`
-- `GET /api/live/{id}/leaderboard`
-
-Roblox:
-- `POST /api/bridge/register`
-- `GET /api/bridge/{id}/poll`
-
-## Segurança
-
-- `DASHBOARD_PASSWORD` não deve ser a mesma senha do TikTok.
-- Nunca coloque `API_KEY` em LocalScript.
-- Mantenha o repositório privado se o código tiver chaves preenchidas.
-- O ZIP entregue não contém nenhuma chave real.
-- Raw payloads de diagnóstico são limitados e campos sensíveis comuns são redigidos.
-
-## Testes incluídos
-
-`tests/test_rules.py` valida o motor de regras sem precisar conectar ao TikTok.
-
-A estrutura também pode ser verificada com:
-
-```bash
-python -m py_compile app/*.py
-```
+As dependências estão fixadas em `requirements.lock`; a CI executa a suíte em Python 3.11 e Node 22. Os testes simulam TikTok e HTTP localmente, sem consumir presentes reais.

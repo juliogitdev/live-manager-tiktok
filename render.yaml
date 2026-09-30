@@ -3,7 +3,7 @@ services:
     name: tiktok-roblox-live-manager
     runtime: python
     plan: free
-    buildCommand: python -m pip install --upgrade pip && pip install -r requirements.txt
+    buildCommand: python -m pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
@@ -15,6 +15,24 @@ services:
         generateValue: true
       - key: DASHBOARD_PASSWORD
         sync: false
+      - key: GAME_TOKENS
+        sync: false
+      - key: ENVIRONMENT
+        value: production
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: RETENTION_SECONDS
+        value: "86400"
+      - key: CONSUMER_TIMEOUT_SECONDS
+        value: "300"
+      - key: MAX_SIMULATIONS
+        value: "20"
+      - key: MAX_CONSUMERS
+        value: "100"
+      - key: MAX_STORED_SESSIONS
+        value: "100"
+      - key: OFFLINE_MAX_SECONDS
+        value: "900"
       - key: MAX_SESSIONS
         value: "5"
       - key: MAX_EVENTS
