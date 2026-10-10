@@ -1,0 +1,28 @@
+import {chromium} from '../../app/node_modules/@playwright/test/index.mjs';
+import {spawn} from 'node:child_process';
+import {mkdtemp,rm,mkdir} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import net from 'node:net';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import assert from 'node:assert/strict';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const temp=await mkdtemp(path.join(tmpdir(),'live-manager-dashboard-'));
+const probe=net.createServer();await new Promise(resolve=>probe.listen(0,'127.0.0.1',resolve));const port=probe.address().port;await new Promise(resolve=>probe.close(resolve));
+const origin='http://127.0.0.1:'+port;
+const child=spawn(path.join(root,'.venv/Scripts/python.exe'),['-m','uvicorn','app.main:app','--host','127.0.0.1','--port',String(port)],{cwd:root,windowsHide:true,env:{...process.env,API_KEY:'qa-only-api-key-0123456789abcdef',SECRET_KEY:'qa-only-session-secret-0123456789abcdef',DASHBOARD_PASSWORD:'qa-dashboard-password',COOKIE_SECURE:'false',ENVIRONMENT:'development',RENDER:'false',DATABASE_PATH:path.join(temp,'db.sqlite3'),AUTO_CONNECT_USERS:'',GAME_TOKENS:'{}'}});
+let browser,serverOutput='';child.stdout.on('data',d=>serverOutput+=d);child.stderr.on('data',d=>serverOutput+=d);
+try{
+ let ready=false;for(let attempt=0;attempt<100;attempt++){try{const response=await fetch(origin+'/api/auth/status');if(response.ok){ready=true;break}}catch{}await new Promise(resolve=>setTimeout(resolve,200))}assert.ok(ready,'Isolated dashboard server did not become ready');
+ browser=await chromium.launch({channel:'msedge',headless:true});const page=await browser.newPage({viewport:{width:390,height:844}}),errors=[];page.on('pageerror',error=>errors.push(error.message));
+ await page.goto(origin);await page.locator('#loginPassword').fill('qa-dashboard-password');await page.locator('#login button.primary').click();await page.waitForFunction(()=>document.getElementById('login').classList.contains('hidden'));await page.locator('[data-tab="game-access"]').click();
+ await page.locator('#accessName').fill('Corrida QA <teste>');await page.locator('#accessConsumer').fill('qa-corrida');await page.locator('#accessUsers').fill('@Minha.Live,\n@SegundaLive @MINHA.live');await page.locator('#accessSave').click();await page.waitForFunction(()=>document.getElementById('accessToken').value.length>20);
+ const token=await page.locator('#accessToken').inputValue();assert.ok(token.length>20);assert.equal(await page.locator('#accessList img').count(),0,'Credential names must be escaped');
+ let data=await(await page.request.get(origin+'/api/game-access')).json();assert.equal(data.credentials.length,1);const credential=data.credentials[0];assert.deepEqual(credential.usernames,['minha.live','segundalive']);assert.equal(JSON.stringify(data).includes(token),false,'Listing must never reveal the token');assert.equal(await page.evaluate(token=>JSON.stringify({...localStorage,...sessionStorage}).includes(token),token),false,'Tokens must not enter browser storage');
+ await page.locator('#accessCopyToken').click();await page.waitForFunction(()=>document.getElementById('accessCopyMessage').textContent.length>0);await page.locator('[data-tab=lives]').click();assert.equal(await page.locator('#accessToken').inputValue(),'','Leaving the tab clears the one-time token');await page.locator('[data-tab="game-access"]').click();await page.waitForSelector('[data-access-edit]');
+ await page.locator('[data-access-edit]').click();await page.locator('#accessUsers').fill('@Nova.Live');await page.locator('#accessSave').click();await page.waitForFunction(()=>document.getElementById('accessList').textContent.includes('@nova.live'));data=await(await page.request.get(origin+'/api/game-access')).json();assert.deepEqual(data.credentials[0].usernames,['nova.live']);assert.equal(await page.locator('#accessToken').inputValue(),'','Editing must not redisplay a secret');
+ await page.locator('[data-access-revoke]').click();data=await(await page.request.get(origin+'/api/game-access')).json();assert.equal(data.credentials[0].active,true,'First revoke button only opens an explicit confirmation');await page.locator('[data-access-cancel]').click();assert.equal(await page.locator('[data-access-confirm]').count(),0);await page.locator('[data-access-revoke]').click();await page.locator('[data-access-confirm]').click();await page.waitForFunction(()=>document.getElementById('accessList').textContent.includes('Revogado'));data=await(await page.request.get(origin+'/api/game-access')).json();assert.equal(data.credentials[0].active,false);
+ await page.locator('#accessName').fill('Token descartado no logout');await page.locator('#accessConsumer').fill('qa-logout');await page.locator('#accessUsers').fill('@teste.live');await page.locator('#accessSave').click();await page.waitForFunction(()=>document.getElementById('accessToken').value.length>20);await page.locator('.logout').click();await page.waitForFunction(()=>!document.getElementById('login').classList.contains('hidden'));assert.equal(await page.locator('#accessToken').inputValue(),'');
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+2),false,'Mobile dashboard must fit the viewport');assert.deepEqual(errors,[]);
+ console.log('Game access browser QA passed: admin login, creation, normalized accounts, escaped names, one-time/no-storage token, edit, explicit revoke, tab/logout cleanup and mobile layout.');
+}finally{await browser?.close();child.kill();await new Promise(resolve=>child.exitCode!==null?resolve():child.once('exit',resolve));await rm(temp,{recursive:true,force:true,maxRetries:5,retryDelay:200});}

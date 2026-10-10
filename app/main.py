@@ -191,6 +191,54 @@ async def meta(request: Request, x_api_key: str | None = Header(default=None)):
     }
 
 
+def credential_store():
+    if manager.store is None:
+        raise HTTPException(503, "Persistent store unavailable")
+    return manager.store
+
+
+@app.get("/api/game-access", response_model=models.GameCredentialList)
+async def list_game_access(request: Request, x_api_key: str | None = Header(default=None)):
+    require_auth(request, x_api_key)
+    return {"credentials": credential_store().game_credentials()}
+
+
+@app.post("/api/game-access", response_model=models.GameCredentialCreated, status_code=201)
+async def create_game_access(body: models.GameAccessFields, request: Request,
+                             x_api_key: str | None = Header(default=None)):
+    require_auth(request, x_api_key)
+    try:
+        credential, token = credential_store().create_game_credential(**body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    response = JSONResponse({"credential": credential, "token": token}, status_code=201)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.patch("/api/game-access/{credential_id}", response_model=models.GameCredentialResult)
+async def edit_game_access(credential_id: str, body: models.GameAccessPatch, request: Request,
+                          x_api_key: str | None = Header(default=None)):
+    require_auth(request, x_api_key)
+    try:
+        credential = credential_store().update_game_credential(credential_id, body.model_dump(exclude_unset=True))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    if credential is None:
+        raise HTTPException(404, "Game credential not found")
+    return {"credential": credential}
+
+
+@app.delete("/api/game-access/{credential_id}", response_model=models.GameCredentialResult)
+async def revoke_game_access(credential_id: str, request: Request,
+                            x_api_key: str | None = Header(default=None)):
+    require_auth(request, x_api_key)
+    credential = credential_store().revoke_game_credential(credential_id)
+    if credential is None:
+        raise HTTPException(404, "Game credential not found")
+    return {"credential": credential}
+
+
 @app.get("/api/live/sessions", response_model=models.Sessions)
 async def list_sessions(request: Request, x_api_key: str | None = Header(default=None)):
     require_auth(request, x_api_key)
@@ -410,7 +458,7 @@ async def export_csv(sid: str, request: Request, x_api_key: str | None = Header(
 # Bridge API: API key only; in-memory history is lost on restart.
 @app.post("/api/bridge/register", response_model=models.Registered)
 async def bridge_register(body: BridgeRegisterRequest, x_api_key: str | None = Header(default=None)):
-    consumer = require_bridge(x_api_key, body.username, body.consumer_id)
+    consumer = require_bridge(x_api_key, body.username, body.consumer_id, store=manager.store)
     try:
         s, created = await manager.connect(body.username, body.profile, simulation=body.simulation)
     except ValueError as exc:
@@ -454,9 +502,9 @@ async def bridge_poll(
     limit: int = Query(100, ge=1, le=250),
     x_api_key: str | None = Header(default=None),
 ):
-    require_bridge_credential(x_api_key)
+    require_bridge_credential(x_api_key, store=manager.store)
     s = get_session(sid)
-    consumer = require_bridge(x_api_key, s.username, consumer_id)
+    consumer = require_bridge(x_api_key, s.username, consumer_id, store=manager.store)
     try:
         manager.activate(s)
         if s.store:
@@ -466,6 +514,8 @@ async def bridge_poll(
 
     # Recheck retention after the wait: a burst can evict events before this task resumes.
     rows = await s.wait_for_events(after, wait) if after <= s.seq else []
+    # Revocation or edited scopes take effect even during an active long poll.
+    require_bridge(x_api_key, s.username, consumer, store=manager.store)
     oldest = s.oldest_seq()
     gap = after < oldest - 1 or after > s.seq
     if gap and (not recover or after > s.seq):
@@ -521,9 +571,9 @@ async def bridge_poll(
 
 @app.post("/api/bridge/{sid}/ack", response_model=models.Ack)
 async def bridge_ack(sid: str, body: AckRequest, x_api_key: str | None = Header(default=None)):
-    require_bridge_credential(x_api_key)
+    require_bridge_credential(x_api_key, store=manager.store)
     s = get_session(sid)
-    consumer = require_bridge(x_api_key, s.username, body.consumer_id)
+    consumer = require_bridge(x_api_key, s.username, body.consumer_id, store=manager.store)
     if not s.store:
         raise HTTPException(503, "Persistent store unavailable")
     try:
