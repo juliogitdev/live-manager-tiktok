@@ -19,7 +19,9 @@ Abra `http://127.0.0.1:8000`. O banco padrão é `data/live-manager.sqlite3`. Va
 
 ## Integração com jogos
 
-Configure `GAME_TOKENS` com token longo e escopo por conta/consumidor. O jogo registra `/api/bridge/register`, lê `/api/bridge/{sid}/poll` com cursor e confirma `/api/bridge/{sid}/ack` após gravar seus efeitos de forma idempotente. O [exemplo Roblox](roblox/TikTokBridge.server.lua) usa esse fluxo; em Electron, mantenha o token no processo principal e encaminhe eventos ao renderer por IPC restrito. Use `profile:"raw"` se as regras de gameplay estiverem no jogo. Sessões `simulation:true` exercitam o fluxo offline sem conexão TikTok.
+Agora você pode criar e editar contas autorizadas pela aba **Acesso dos jogos**, sem alterar variáveis a cada @. Copie o token exibido na criação e utilize-o no jogo. Consulte o [passo a passo](ACESSO_DOS_JOGOS.md), o [contrato](GAME_ACCESS_API.md) e a [análise](ANALISE_ACESSO_WEB.md). `GAME_TOKENS` continua aceito por compatibilidade.
+
+Para acessos legados, `GAME_TOKENS` aceita tokens longos com escopo por conta/consumidor. O jogo registra `/api/bridge/register`, lê `/api/bridge/{sid}/poll` com cursor e confirma `/api/bridge/{sid}/ack` após gravar seus efeitos de forma idempotente. O [exemplo Roblox](roblox/TikTokBridge.server.lua) usa esse fluxo; em Electron, mantenha o token no processo principal e encaminhe eventos ao renderer por IPC restrito. Use `profile:"raw"` se as regras de gameplay estiverem no jogo. Sessões `simulation:true` exercitam o fluxo offline sem conexão TikTok.
 
 O servidor retém eventos por 24 horas por padrão, mas só pode recuperar eventos que recebeu e gravou. `gap_detected` indica perda fora da janela. O jogo ainda precisa deduplicar recompensas; ACK sozinho não garante efeitos exatamente uma vez.
 
@@ -27,7 +29,7 @@ O servidor retém eventos por 24 horas por padrão, mas só pode recuperar event
 
 O `render.yaml` padrão mantém o **plano Free**, sem disco persistente. Ele serve para testes, mas o SQLite local e os ACKs são perdidos quando o serviço reinicia, dorme ou recebe deploy, conforme a [documentação oficial](https://render.com/docs/free). Nesse caso, o jogo verá uma nova sessão e deve tratar a lacuna; não use a recuperação durável como garantia.
 
-Por enquanto, o repositório oferece apenas o Blueprint Free. Após validar o fluxo, a migração para um plano com disco persistente pode configurar `DATABASE_PATH` no volume para conservar eventos e ACKs entre reinícios. Configure `GAME_TOKENS` se usar token de jogo, e mantenha `SECRET_KEY` e `API_KEY` como segredos independentes.
+Por enquanto, o repositório oferece apenas o Blueprint Free. Após validar o fluxo, a migração para um plano com disco persistente pode configurar `DATABASE_PATH` no volume para conservar eventos e ACKs entre reinícios. Cadastre os tokens pela web ou preserve `GAME_TOKENS` para acessos legados, e mantenha `SECRET_KEY` e `API_KEY` como segredos independentes.
 
 Não houve deploy nesta alteração. Após publicar, confirme `/health`, valide uma live real e verifique backups do banco antes de depender de presentes para recompensas.
 

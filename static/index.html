@@ -28,6 +28,7 @@
       <button data-tab="rules" onclick="tab('rules')">◇ <span>Regras</span></button>
       <button data-tab="ranking" onclick="tab('ranking')">★ <span>Ranking</span></button>
       <button data-tab="roblox" onclick="tab('roblox')">◆ <span>Roblox/Teste</span></button>
+      <button data-tab="game-access" onclick="tab('game-access')">⚿ <span>Acesso dos jogos</span></button>
     </nav>
     <button class="logout" onclick="logout()">Sair</button>
   </aside>
@@ -209,8 +210,42 @@
         </div>
       </div>
     </section>
+    <section id="game-access" class="page hidden">
+      <div class="card access-intro">
+        <h3>Uma credencial para cada jogo</h3>
+        <p class="muted">Autorize as contas que cada aplicação pode conectar. Crie e gerencie os acessos neste painel, sem editar arquivos ou variáveis do servidor.</p>
+        <p class="muted">A credencial pertence ao jogo que consome os eventos. A senha deste painel continua reservada ao administrador.</p>
+      </div>
+      <div class="access-layout">
+        <div class="card">
+          <div class="row between"><h3 id="accessFormTitle">Criar acesso de jogo</h3><button id="accessCancelEdit" class="hidden" type="button">Cancelar edição</button></div>
+          <form id="accessForm">
+            <label for="accessName">Nome do jogo</label><input id="accessName" required maxlength="100" placeholder="Corrida presidencial" autocomplete="off">
+            <label for="accessConsumer">Identificador do jogo (consumer_id)</label><input id="accessConsumer" required maxlength="100" placeholder="corrida-presidencial" autocomplete="off" spellcheck="false">
+            <label for="accessUsers">Contas TikTok autorizadas</label><textarea id="accessUsers" class="access-users-input" required placeholder="@minha.live&#10;@outra.live" spellcheck="false"></textarea>
+            <p class="muted">Separe os usuários por linha, vírgula ou espaço. Somente as contas listadas terão acesso; informe nomes sem links.</p>
+            <button id="accessSave" class="primary" type="submit">Criar credencial</button>
+            <p id="accessMessage" class="muted" role="status"></p>
+          </form>
+        </div>
+        <div>
+          <div id="accessTokenPanel" class="card access-token-panel hidden">
+            <h3>Credencial criada — copie agora</h3>
+            <p class="muted">Esta chave é mostrada somente na criação. Copie para o painel de configuração do seu jogo antes de fechar esta mensagem ou sair da aba.</p>
+            <label for="accessToken">Token de acesso</label><input id="accessToken" readonly autocomplete="off" spellcheck="false">
+            <div class="row"><button id="accessCopyToken" class="primary" type="button">Copiar token</button><button id="accessDismissToken" type="button">Já copiei · ocultar</button></div>
+            <p id="accessCopyMessage" class="muted" role="status"></p>
+          </div>
+          <div class="card">
+            <div class="row between"><h3>Jogos autorizados</h3><button id="accessRefresh" type="button">Atualizar</button></div>
+            <div id="accessList" class="access-list"><p class="muted">Abra esta aba para consultar os acessos.</p></div>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <script src="/static/app.js"></script>
+  <script src="/static/game-access.js"></script>
 </body>
 </html>

@@ -12,6 +12,7 @@ let generation = 0;
 let refreshPending = null;
 
 function stopDashboard(){
+  if(typeof window!=="undefined")window.gameAccess?.clearSecrets();
   active = false;
   generation++;
   clearInterval(pollTimer); pollTimer = null;
@@ -77,7 +78,9 @@ function tab(name){
   $(name).classList.remove("hidden");
   document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("active",b.dataset.tab===name));
   currentTab=name;
+  if(typeof window!=="undefined")window.gameAccess?.onTab(name);
   const titles={
+    "game-access":["Acesso dos jogos","Autorize aplicações e contas TikTok pelo painel, sem redeploy."],
     lives:["Lives","Conecte contas sem redeploy e acompanhe cada sessão."],
     events:["Eventos","Feed em tempo real e exportação."],
     monitor:["Monitor","Diagnóstico de conexão e sinais de segurança."],

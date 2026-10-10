@@ -147,9 +147,17 @@ def game_tokens(raw):
         raise RuntimeError("Invalid GAME_TOKENS: expected tokens with consumer_id and usernames") from None
 
 
-def require_bridge(key, username, consumer_id=None):
+def require_bridge(key, username, consumer_id=None, store=None):
     if key and settings.api_key and hmac.compare_digest(key.encode(), settings.api_key.encode()):
         return consumer_id or "roblox"
+    database_credential = store.lookup_game_token(key) if store and key else None
+    if database_credential:
+        names = set(database_credential["usernames"])
+        if username.strip().lstrip("@").casefold() not in names:
+            raise HTTPException(403, "Token does not allow this account")
+        if consumer_id is not None and consumer_id != database_credential["consumer_id"]:
+            raise HTTPException(403, "Token is bound to another consumer")
+        return database_credential["consumer_id"]
     for token, spec in game_tokens(settings.game_tokens).items():
         if key and hmac.compare_digest(key.encode(), token.encode()):
             names = {n.strip().lstrip("@").casefold() for n in spec["usernames"]}
@@ -158,15 +166,17 @@ def require_bridge(key, username, consumer_id=None):
             if consumer_id is not None and consumer_id != spec["consumer_id"]:
                 raise HTTPException(403, "Token is bound to another consumer")
             return spec["consumer_id"]
-    raise HTTPException(401 if settings.api_key or game_tokens(settings.game_tokens) else 503, "Invalid bridge credential")
+    raise HTTPException(401 if settings.api_key or game_tokens(settings.game_tokens) or store is not None else 503, "Invalid bridge credential")
 
 
-def require_bridge_credential(key):
+def require_bridge_credential(key, store=None):
     if key and settings.api_key and hmac.compare_digest(key.encode(), settings.api_key.encode()):
+        return
+    if store and key and store.lookup_game_token(key):
         return
     if key and any(hmac.compare_digest(key.encode(), token.encode()) for token in game_tokens(settings.game_tokens)):
         return
-    raise HTTPException(401 if settings.api_key or game_tokens(settings.game_tokens) else 503, "Invalid bridge credential")
+    raise HTTPException(401 if settings.api_key or game_tokens(settings.game_tokens) or store is not None else 503, "Invalid bridge credential")
 
 
 class LoginLimiter:

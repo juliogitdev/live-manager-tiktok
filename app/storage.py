@@ -6,6 +6,9 @@ claimed for an ephemeral host filesystem, nor for events never received from Tik
 import json
 import sqlite3
 import time
+import hashlib
+import secrets
+import uuid
 from pathlib import Path
 
 
@@ -36,7 +39,69 @@ class EventStore:
                 sid TEXT NOT NULL REFERENCES sessions(sid) ON DELETE CASCADE,
                 identity TEXT NOT NULL, payload TEXT NOT NULL,
                 PRIMARY KEY(sid, identity));
+            CREATE TABLE IF NOT EXISTS game_credentials (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
+                consumer_id TEXT NOT NULL, usernames TEXT NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, revoked_at INTEGER);
         ''')
+
+    def game_credentials(self):
+        return [self._game_credential(row) for row in self.db.execute(
+            "SELECT id,name,consumer_id,usernames,created_at,updated_at,revoked_at FROM game_credentials ORDER BY created_at DESC,id")]
+
+    @staticmethod
+    def _game_credential(row):
+        if row is None:
+            return None
+        value = dict(zip(("id", "name", "consumer_id", "usernames", "created_at", "updated_at", "revoked_at"), row))
+        value["usernames"] = json.loads(value["usernames"])
+        value["active"] = value["revoked_at"] is None
+        return value
+
+    def game_credential(self, credential_id):
+        return self._game_credential(self.db.execute(
+            "SELECT id,name,consumer_id,usernames,created_at,updated_at,revoked_at FROM game_credentials WHERE id=?",
+            (credential_id,)).fetchone())
+
+    def lookup_game_token(self, token):
+        if not isinstance(token, str) or len(token) > 1024:
+            return None
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        return self._game_credential(self.db.execute(
+            "SELECT id,name,consumer_id,usernames,created_at,updated_at,revoked_at FROM game_credentials WHERE token_hash=? AND revoked_at IS NULL",
+            (digest,)).fetchone())
+
+    def create_game_credential(self, name, consumer_id, usernames):
+        if self.db.execute("SELECT COUNT(*) FROM game_credentials WHERE revoked_at IS NULL").fetchone()[0] >= 1000:
+            raise ValueError("Active game credential limit reached")
+        token = "game_" + secrets.token_urlsafe(48)
+        credential_id = uuid.uuid4().hex
+        now = int(time.time() * 1000)
+        with self.db:
+            self.db.execute("INSERT INTO game_credentials VALUES(?,?,?,?,?,?,?,NULL)",
+                            (credential_id, name, hashlib.sha256(token.encode()).hexdigest(), consumer_id,
+                             json.dumps(usernames), now, now))
+        return self.game_credential(credential_id), token
+
+    def update_game_credential(self, credential_id, changes):
+        current = self.game_credential(credential_id)
+        if current is None:
+            return None
+        if not current["active"]:
+            raise ValueError("Revoked credentials cannot be edited; create a new credential")
+        value = {**current, **changes}
+        with self.db:
+            self.db.execute("UPDATE game_credentials SET name=?,consumer_id=?,usernames=?,updated_at=? WHERE id=?",
+                            (value["name"], value["consumer_id"], json.dumps(value["usernames"]),
+                             int(time.time() * 1000), credential_id))
+        return self.game_credential(credential_id)
+
+    def revoke_game_credential(self, credential_id):
+        now = int(time.time() * 1000)
+        with self.db:
+            self.db.execute("UPDATE game_credentials SET revoked_at=COALESCE(revoked_at,?),updated_at=? WHERE id=?",
+                            (now, now, credential_id))
+        return self.game_credential(credential_id)
 
     def save(self, session, event=None, origin=None):
         snap = session.snapshot()
